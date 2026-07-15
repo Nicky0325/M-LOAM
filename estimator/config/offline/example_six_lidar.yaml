@@ -1,0 +1,107 @@
+dataset_root: /data/multilidar_sequence
+output_root: /data/mloam_offline_results
+mloam_config: estimator/config/config_realvehicle_mltest.yaml
+reference_lidar: top
+synchronization_threshold: 0.06
+frame_begin: 0
+frame_end: 760
+frame_stride: 1
+minimum_finite_ratio: 0.95
+
+lidars:
+  - name: top
+    enabled: true
+    directory: top
+    rings: 128
+    horizontal_fov_deg: 360
+    expected_width: 1800
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    segment_cloud: true
+    min_cluster_size: 30
+    segment_valid_point_num: 5
+    segment_valid_line_num: 3
+    segment_theta: 1.047
+    time_offset: 0.0
+    color: [230, 25, 75]
+    vehicle_T_lidar: {translation: [0, 0, 0], rpy_deg: [0, 0, 0]}
+  - name: front
+    enabled: true
+    directory: front
+    rings: 32
+    horizontal_fov_deg: 120
+    expected_width: 1800
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    segment_cloud: true
+    min_cluster_size: 30
+    segment_valid_point_num: 5
+    segment_valid_line_num: 3
+    segment_theta: 1.047
+    time_offset: 0.0
+    color: [60, 180, 75]
+    vehicle_T_lidar: {translation: [1.0, 0, 0], rpy_deg: [0, 0, 0]}
+  - name: rear
+    enabled: true
+    directory: rear
+    rings: 32
+    horizontal_fov_deg: 120
+    expected_width: 1800
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    segment_cloud: true
+    min_cluster_size: 30
+    segment_valid_point_num: 5
+    segment_valid_line_num: 3
+    segment_theta: 1.047
+    time_offset: 0.0
+    color: [255, 225, 25]
+    vehicle_T_lidar: {translation: [-1.0, 0, 0], rpy_deg: [0, 0, 180]}
+  - name: left
+    enabled: true
+    directory: left
+    rings: 32
+    horizontal_fov_deg: 120
+    expected_width: 1800
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    segment_cloud: true
+    min_cluster_size: 30
+    segment_valid_point_num: 5
+    segment_valid_line_num: 3
+    segment_theta: 1.047
+    time_offset: 0.0
+    color: [0, 130, 200]
+    vehicle_T_lidar: {translation: [0, 0.8, 0], rpy_deg: [0, 0, 90]}
+  - name: right
+    enabled: true
+    directory: right
+    rings: 32
+    horizontal_fov_deg: 120
+    expected_width: 1800
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    segment_cloud: true
+    min_cluster_size: 30
+    segment_valid_point_num: 5
+    segment_valid_line_num: 3
+    segment_theta: 1.047
+    time_offset: 0.0
+    color: [245, 130, 48]
+    vehicle_T_lidar: {translation: [0, -0.8, 0], rpy_deg: [0, 0, -90]}
+  - name: rear_top
+    enabled: true
+    directory: rear_top
+    rings: 128
+    horizontal_fov_deg: 360
+    expected_width: 1800
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    segment_cloud: true
+    min_cluster_size: 30
+    segment_valid_point_num: 5
+    segment_valid_line_num: 3
+    segment_theta: 1.047
+    time_offset: 0.0
+    color: [145, 30, 180]
+    vehicle_T_lidar: {translation: [-0.5, 0, 0.2], rpy_deg: [0, 0, 0]}

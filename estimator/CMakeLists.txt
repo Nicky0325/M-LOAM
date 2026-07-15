@@ -31,6 +31,7 @@ find_package(PCL REQUIRED)
 find_package(Ceres REQUIRED)
 find_package(Gflags REQUIRED)
 find_package(Glog REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 find_package(OpenMP REQUIRED)
 if (OPENMP_FOUND)
@@ -41,6 +42,7 @@ endif()
 
 include_directories(
 	3rdparty
+	offline/include
 	${catkin_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR} ${PCL_INCLUDE_DIRS}
 	${CERES_INCLUDE_DIRS} ${Sophus_INCLUDE_DIRS} ${GFLAGS_INCLUDE_DIRS} ${GLOG_INCLUDE_DIRS}
 )
@@ -53,6 +55,18 @@ catkin_package(
 )
 
 ######################################################## float libraries
+add_library(mloam_offline
+    offline/src/artifacts.cpp
+    offline/src/lidar_mapper.cpp
+    offline/src/manifest.cpp
+    offline/src/pcd_preprocessor.cpp
+    offline/src/runner.cpp
+    offline/src/scenario.cpp
+    offline/src/sequence_reader.cpp
+)
+target_include_directories(mloam_offline PUBLIC offline/include ${PCL_INCLUDE_DIRS})
+target_link_libraries(mloam_offline ${PCL_LIBRARIES} yaml-cpp)
+
 add_library(mloam_lib
     src/initial/initial_extrinsics.cpp
     src/featureExtract/feature_extract.cpp
@@ -68,6 +82,7 @@ add_library(mloam_lib
     src/factor/marginalization_factor.cpp
 )
 target_link_libraries(mloam_lib
+    mloam_offline
     ${catkin_LIBRARIES} ${OpenCV_LIBS} ${PCL_LIBRARIES} ${CERES_LIBRARIES} 
     ${GFLAGS_LIBRARIES} ${GLOG_LIBRARIES}
 )
@@ -91,8 +106,14 @@ target_link_libraries(mloam_node_rv_oxford mloam_lib)
 add_executable(mloam_node_rv_kitti src/rosNodeRVKITTI.cpp)
 target_link_libraries(mloam_node_rv_kitti mloam_lib)
 
-add_executable(lidar_mapper_keyframe src/lidarMapper/lidar_mapper_keyframe.cpp)
-target_link_libraries(lidar_mapper_keyframe mloam_lib)
+add_library(mloam_mapper_core src/lidarMapper/lidar_mapper_keyframe.cpp)
+target_link_libraries(mloam_mapper_core mloam_lib)
+
+add_executable(lidar_mapper_keyframe src/lidarMapper/lidar_mapper_main.cpp)
+target_link_libraries(lidar_mapper_keyframe mloam_mapper_core)
+
+add_executable(mloam_offline_runner offline/src/offline_runner.cpp)
+target_link_libraries(mloam_offline_runner mloam_lib mloam_offline mloam_mapper_core)
 
 add_dependencies(mloam_lib ${catkin_EXPORTED_TARGETS})
 add_dependencies(kittiHelper ${catkin_EXPORTED_TARGETS})
@@ -102,3 +123,5 @@ add_dependencies(mloam_node_rv_hercules ${catkin_EXPORTED_TARGETS})
 add_dependencies(mloam_node_rv_oxford ${catkin_EXPORTED_TARGETS})
 add_dependencies(mloam_node_rv_kitti ${catkin_EXPORTED_TARGETS})
 add_dependencies(lidar_mapper_keyframe ${catkin_EXPORTED_TARGETS})
+add_dependencies(mloam_mapper_core ${catkin_EXPORTED_TARGETS})
+add_dependencies(mloam_offline_runner ${catkin_EXPORTED_TARGETS})

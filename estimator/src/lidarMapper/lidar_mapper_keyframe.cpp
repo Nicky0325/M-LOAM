@@ -14,6 +14,7 @@
 #define PCL_NO_PRECOMPILE
 
 #include "lidar_mapper.h"
+#include "lidar_mapper_core.h"
 
 using namespace common;
 
@@ -356,16 +357,23 @@ void extractSurroundingKeyFrames()
 void downsampleCurrentScan()
 {
     laser_cloud_surf_last_ds->clear();
-    down_size_filter_surf.setInputCloud(laser_cloud_surf_last);
-    down_size_filter_surf.filter(*laser_cloud_surf_last_ds);
-
     laser_cloud_corner_last_ds->clear();
-    down_size_filter_corner.setInputCloud(laser_cloud_corner_last);
-    down_size_filter_corner.filter(*laser_cloud_corner_last_ds);
-
     laser_cloud_outlier_ds->clear();
-    down_size_filter_outlier.setInputCloud(laser_cloud_outlier);
-    down_size_filter_outlier.filter(*laser_cloud_outlier_ds);
+    for (int sensor = 0; sensor < NUM_OF_LASER; ++sensor) {
+        PointICloud::Ptr surf(new PointICloud()), corner(new PointICloud()), outlier(new PointICloud());
+        for (const auto &p : *laser_cloud_surf_last) if (std::lround(p.intensity) == sensor) surf->push_back(p);
+        for (const auto &p : *laser_cloud_corner_last) if (std::lround(p.intensity) == sensor) corner->push_back(p);
+        for (const auto &p : *laser_cloud_outlier) if (std::lround(p.intensity) == sensor) outlier->push_back(p);
+        PointICloud filtered;
+        down_size_filter_surf.setInputCloud(surf); down_size_filter_surf.filter(filtered);
+        for (auto &p : filtered) p.intensity = sensor; *laser_cloud_surf_last_ds += filtered;
+        filtered.clear();
+        down_size_filter_corner.setInputCloud(corner); down_size_filter_corner.filter(filtered);
+        for (auto &p : filtered) p.intensity = sensor; *laser_cloud_corner_last_ds += filtered;
+        filtered.clear();
+        down_size_filter_outlier.setInputCloud(outlier); down_size_filter_outlier.filter(filtered);
+        for (auto &p : filtered) p.intensity = sensor; *laser_cloud_outlier_ds += filtered;
+    }
 
     // propagate the extrinsic uncertainty on points
     laser_cloud_surf_cov->clear();
@@ -1224,7 +1232,92 @@ void sigintHandler(int sig)
     ros::shutdown();
 }
 
-int main(int argc, char **argv)
+void initializeLidarMapperCore(bool with_uncertainty,
+                               double good_feature_ratio)
+{
+    down_size_filter_surf.setLeafSize(MAP_SURF_RES, MAP_SURF_RES, MAP_SURF_RES);
+    down_size_filter_surf.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
+    down_size_filter_corner.setLeafSize(MAP_CORNER_RES, MAP_CORNER_RES, MAP_CORNER_RES);
+    down_size_filter_corner.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
+    down_size_filter_outlier.setLeafSize(MAP_OUTLIER_RES, MAP_OUTLIER_RES, MAP_OUTLIER_RES);
+    down_size_filter_outlier.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
+
+    down_size_filter_surf_map_cov.setLeafSize(MAP_SURF_RES, MAP_SURF_RES, MAP_SURF_RES);
+    down_size_filter_surf_map_cov.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
+    down_size_filter_corner_map_cov.setLeafSize(MAP_CORNER_RES, MAP_CORNER_RES, MAP_CORNER_RES);
+    down_size_filter_corner_map_cov.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
+    down_size_filter_outlier_map_cov.setLeafSize(MAP_OUTLIER_RES, MAP_OUTLIER_RES, MAP_OUTLIER_RES);
+    down_size_filter_outlier_map_cov.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
+    down_size_filter_surrounding_keyframes.setLeafSize(MAP_SUR_KF_RES, MAP_SUR_KF_RES, MAP_SUR_KF_RES);
+    down_size_filter_global_map_keyframes.setLeafSize(10, 10, 10);
+
+    cov_mapping.setZero();
+    with_ua_flag = with_uncertainty;
+    gf_ratio_cur = std::min(1.0, good_feature_ratio);
+    pose_ext.assign(NUM_OF_LASER, Pose());
+    frame_cnt = 0;
+    frame_drop_cnt = 0;
+    pose_wmap_prev = Pose();
+    pose_wmap_curr = Pose();
+    pose_wmap_wodom = Pose();
+    pose_wodom_curr = Pose();
+    pose_point_prev.x = pose_point_prev.y = pose_point_prev.z = 0.0;
+    q_ori_prev.setIdentity();
+    pose_point_cur.x = pose_point_cur.y = pose_point_cur.z = 0.0;
+    q_ori_cur.setIdentity();
+    pose_keyframes_6d.clear();
+    pose_keyframes_3d->clear();
+    laser_keyframes_6d.poses.clear();
+    surf_cloud_keyframes_cov.clear();
+    corner_cloud_keyframes_cov.clear();
+    outlier_cloud_keyframes_cov.clear();
+    surrounding_existing_keyframes_id.clear();
+    surrounding_surf_cloud_keyframes.clear();
+    surrounding_corner_cloud_keyframes.clear();
+    d_factor_list.clear();
+    d_eigvec_list.clear();
+    gf_logdet_H_list.clear();
+    gf_deg_factor_list.clear();
+    mapping_sp_list.clear();
+    total_match_feature.clear();
+    total_solver.clear();
+    total_mapping.clear();
+    laser_cloud_surf_from_map_cov->clear();
+    laser_cloud_corner_from_map_cov->clear();
+    laser_cloud_surf_from_map_cov_ds->clear();
+    laser_cloud_corner_from_map_cov_ds->clear();
+}
+
+LidarMapperFrameResult processLidarMapperFrame(const LidarMapperFrameInput &input)
+{
+    if (input.extrinsics.size() != static_cast<size_t>(NUM_OF_LASER))
+        throw std::invalid_argument("mapper extrinsic count does not match NUM_OF_LASER");
+    std::lock_guard<std::mutex> lock(m_process);
+    *laser_cloud_full_res = input.full_cloud;
+    *laser_cloud_outlier = input.outlier_cloud;
+    *laser_cloud_surf_last = input.surface_cloud;
+    *laser_cloud_corner_last = input.corner_cloud;
+    time_laser_cloud_surf_last = input.timestamp;
+    time_laser_cloud_corner_last = input.timestamp;
+    time_laser_cloud_full_res = input.timestamp;
+    time_laser_cloud_outlier = input.timestamp;
+    time_laser_odometry = input.timestamp;
+    time_ext = input.timestamp;
+    pose_wodom_curr = input.odometry;
+    pose_ext = input.extrinsics;
+    ++frame_cnt;
+
+    transformAssociateToMap();
+    extractSurroundingKeyFrames();
+    downsampleCurrentScan();
+    scan2MapOptimization();
+    transformUpdate();
+    saveKeyframe();
+    if (save_new_keyframe) clearCloud();
+    return {pose_wmap_curr, save_new_keyframe};
+}
+
+int runLegacyLidarMapper(int argc, char **argv)
 {
 	// if (argc < 5)
 	// {
@@ -1276,39 +1369,7 @@ int main(int argc, char **argv)
     pub_keyframes = nh.advertise<sensor_msgs::PointCloud2>("/laser_map_keyframes", 5);
     pub_keyframes_6d = nh.advertise<mloam_msgs::Keyframes>("/laser_map_keyframes_6d", 5);
 
-    down_size_filter_surf.setLeafSize(MAP_SURF_RES, MAP_SURF_RES, MAP_SURF_RES);
-    down_size_filter_surf.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
-    down_size_filter_corner.setLeafSize(MAP_CORNER_RES, MAP_CORNER_RES, MAP_CORNER_RES);
-    down_size_filter_corner.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
-    down_size_filter_outlier.setLeafSize(MAP_OUTLIER_RES, MAP_OUTLIER_RES, MAP_OUTLIER_RES);
-    down_size_filter_outlier.setTraceThreshold(TRACE_THRESHOLD_MAPPING);    
-
-    down_size_filter_surf_map_cov.setLeafSize(MAP_SURF_RES, MAP_SURF_RES, MAP_SURF_RES);
-    down_size_filter_surf_map_cov.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
-    down_size_filter_corner_map_cov.setLeafSize(MAP_CORNER_RES, MAP_CORNER_RES, MAP_CORNER_RES);
-    down_size_filter_corner_map_cov.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
-    down_size_filter_outlier_map_cov.setLeafSize(MAP_OUTLIER_RES, MAP_OUTLIER_RES, MAP_OUTLIER_RES);
-    down_size_filter_outlier_map_cov.setTraceThreshold(TRACE_THRESHOLD_MAPPING);
-    down_size_filter_surrounding_keyframes.setLeafSize(MAP_SUR_KF_RES, MAP_SUR_KF_RES, MAP_SUR_KF_RES);
-    down_size_filter_global_map_keyframes.setLeafSize(10, 10, 10);
-
-    cov_mapping.setZero();
-
-    pose_ext.resize(NUM_OF_LASER);
-
-    pose_point_prev.x = 0.0;
-    pose_point_prev.y = 0.0;
-    pose_point_prev.z = 0.0;
-    q_ori_prev.setIdentity();
-
-    pose_point_cur.x = 0.0;
-    pose_point_cur.y = 0.0;
-    pose_point_cur.z = 0.0;
-    q_ori_cur.setIdentity();
-
-    pose_keyframes_6d.clear();
-    pose_keyframes_3d->clear();
-    laser_keyframes_6d.poses.clear();
+    initializeLidarMapperCore(FLAGS_with_ua, FLAGS_gf_ratio_ini);
 
     signal(SIGINT, sigintHandler);
 
@@ -1326,6 +1387,3 @@ int main(int argc, char **argv)
     mapping_process.join();
     return 0;
 }
-
-
-

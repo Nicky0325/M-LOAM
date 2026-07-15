@@ -340,6 +340,143 @@ void Estimator::inputCloud(const double &t, const std::vector<PointITimeCloud> &
     if (!MULTIPLE_THREAD) processMeasurements();
 }
 
+Estimator::PreparedEstimate Estimator::processPreparedFrame(
+    const double &t,
+    const std::vector<mloam::offline::PreparedLidarFrame> &prepared_frames,
+    bool publish_ros)
+{
+    if (prepared_frames.size() != NUM_OF_LASER)
+        throw std::invalid_argument("prepared LiDAR frame count does not match estimator configuration");
+
+    std::vector<cloudFeature> feature_frame(NUM_OF_LASER);
+    PreparedEstimate estimate;
+    estimate.corner_features.resize(NUM_OF_LASER, 0);
+    estimate.surface_features.resize(NUM_OF_LASER, 0);
+
+    const size_t configured_n_scans = N_SCANS;
+    for (size_t i = 0; i < prepared_frames.size(); ++i)
+    {
+        const auto &prepared = prepared_frames[i];
+        PointICloud laser_cloud;
+        laser_cloud.reserve(prepared.ring_ordered_points.size());
+        for (const auto &point : prepared.ring_ordered_points)
+        {
+            PointI encoded;
+            encoded.x = point.x;
+            encoded.y = point.y;
+            encoded.z = point.z;
+            encoded.intensity = point.intensity;
+            laser_cloud.push_back(encoded);
+        }
+
+        const size_t ring_count = prepared.ring_start_indices.size();
+        if (ring_count == 0 || prepared.ring_end_indices.size() != ring_count)
+            throw std::invalid_argument("prepared LiDAR frame has invalid ring metadata");
+        ScanInfo scan_info(static_cast<int>(ring_count), false);
+        for (size_t ring = 0; ring < ring_count; ++ring)
+        {
+            const size_t start = prepared.ring_start_indices[ring];
+            const size_t end = prepared.ring_end_indices[ring];
+            if (start == std::numeric_limits<size_t>::max() ||
+                end == std::numeric_limits<size_t>::max() || end < start + 11)
+            {
+                scan_info.scan_start_ind_[ring] = 0;
+                scan_info.scan_end_ind_[ring] = 0;
+            }
+            else
+            {
+                scan_info.scan_start_ind_[ring] = static_cast<int>(start + 5);
+                scan_info.scan_end_ind_[ring] = static_cast<int>(end - 5);
+            }
+        }
+
+        N_SCANS = ring_count;
+        if (laser_cloud.size() >= 11)
+        {
+            f_extract_.extractCloud(laser_cloud, scan_info, feature_frame[i]);
+        }
+        else
+        {
+            feature_frame[i]["laser_cloud"] = laser_cloud;
+            feature_frame[i]["corner_points_sharp"] = PointICloud();
+            feature_frame[i]["corner_points_less_sharp"] = PointICloud();
+            feature_frame[i]["surf_points_flat"] = PointICloud();
+            feature_frame[i]["surf_points_less_flat"] = laser_cloud;
+        }
+        feature_frame[i]["laser_cloud_outlier"] = PointICloud();
+        auto &outliers = feature_frame[i]["laser_cloud_outlier"];
+        outliers.reserve(prepared.outlier_ring_ordered_points.size());
+        for (const auto &point : prepared.outlier_ring_ordered_points)
+        {
+            PointI encoded;
+            encoded.x = point.x;
+            encoded.y = point.y;
+            encoded.z = point.z;
+            encoded.intensity = point.intensity;
+            outliers.push_back(encoded);
+        }
+        estimate.corner_features[i] = feature_frame[i]["corner_points_less_sharp"].size();
+        estimate.surface_features[i] = feature_frame[i]["surf_points_less_flat"].size();
+        total_corner_feature_ += estimate.corner_features[i];
+        total_surf_feature_ += estimate.surface_features[i];
+    }
+    N_SCANS = configured_n_scans;
+
+    std::lock_guard<std::mutex> process_lock(m_process_);
+    cur_feature_ = std::make_pair(t, std::move(feature_frame));
+    cur_time_ = t + td_;
+    process();
+
+    // Reproduce the exact cloud/provenance contract historically transported
+    // to lidar_mapper_keyframe through ROS topics, without serialization.
+    for (size_t n = 0; n < NUM_OF_LASER; ++n)
+    {
+        Pose pose_ext(qbl_[n], tbl_[n]);
+        cloudFeature transformed;
+        for (const auto &feature : cur_feature_.second[n])
+        {
+            PointICloud cloud;
+            pcl::transformPointCloud(feature.second, cloud,
+                                     pose_ext.T_.cast<float>());
+            for (auto &point : cloud.points)
+                point.intensity = static_cast<float>(n);
+            transformed.emplace(feature.first, std::move(cloud));
+        }
+        estimate.full_cloud += transformed["laser_cloud"];
+        if ((ESTIMATE_EXTRINSIC == 0) || (n == IDX_REF))
+        {
+            estimate.outlier_cloud += transformed["laser_cloud_outlier"];
+            estimate.corner_cloud += transformed["corner_points_less_sharp"];
+            estimate.surface_cloud += transformed["surf_points_less_flat"];
+        }
+    }
+    if (publish_ros)
+    {
+        pubOdometry(*this, cur_time_);
+        if (frame_cnt_ % SKIP_NUM_ODOM_PUB == 0) pubPointCloud(*this, cur_time_);
+    }
+    frame_cnt_++;
+
+    Pose world_pose;
+    if (solver_flag_ == Estimator::SolverFlag::INITIAL || cir_buf_cnt_ == 0)
+        world_pose = pose_laser_cur_[IDX_REF];
+    else
+        world_pose = Pose(Qs_[cir_buf_cnt_ - 1], Ts_[cir_buf_cnt_ - 1]);
+    estimate.world_R_reference = world_pose.q_;
+    estimate.world_t_reference = world_pose.t_;
+    estimate.reference_R_lidar = qbl_;
+    estimate.reference_t_lidar = tbl_;
+    estimate.observable.resize(NUM_OF_LASER, false);
+    for (size_t i = 0; i < NUM_OF_LASER; ++i)
+    {
+        if (i == IDX_REF)
+            estimate.observable[i] = true;
+        else if (i < cur_eig_calib_.size())
+            estimate.observable[i] = cur_eig_calib_[i] >= LAMBDA_THRE_CALIB;
+    }
+    return estimate;
+}
+
 void Estimator::processMeasurements()
 {
     while (1)

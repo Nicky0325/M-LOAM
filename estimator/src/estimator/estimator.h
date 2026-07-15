@@ -58,6 +58,7 @@
 #include "../factor/prior_factor.hpp"
 #include "../factor/impl_loss_function.hpp"
 #include "mloam_pcl/point_with_time.hpp"
+#include "mloam/offline/types.hpp"
 
 #define MAX_FEATURE_SELECT_TIME 7 // 7ms
 #define MAX_RANDOM_QUEUE_TIME 10
@@ -65,6 +66,21 @@
 class Estimator
 {
   public:
+    struct PreparedEstimate
+    {
+        Eigen::Quaterniond world_R_reference = Eigen::Quaterniond::Identity();
+        Eigen::Vector3d world_t_reference = Eigen::Vector3d::Zero();
+        std::vector<Eigen::Quaterniond> reference_R_lidar;
+        std::vector<Eigen::Vector3d> reference_t_lidar;
+        std::vector<bool> observable;
+        std::vector<size_t> corner_features;
+        std::vector<size_t> surface_features;
+        common::PointICloud full_cloud;
+        common::PointICloud outlier_cloud;
+        common::PointICloud corner_cloud;
+        common::PointICloud surface_cloud;
+    };
+
     Estimator();
     ~Estimator();
 
@@ -74,6 +90,10 @@ class Estimator
     void inputCloud(const double &t, const std::vector<common::PointCloud> &v_laser_cloud_in);
     void inputCloud(const double &t, const std::vector<common::PointITimeCloud> &v_laser_cloud_in);
     void inputCloud(const double &t, const common::PointCloud &laser_cloud_in);
+    PreparedEstimate processPreparedFrame(
+        const double &t,
+        const std::vector<mloam::offline::PreparedLidarFrame> &prepared_frames,
+        bool publish_ros = false);
 
     // process measurements
     void processMeasurements();

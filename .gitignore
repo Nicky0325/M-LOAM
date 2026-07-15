@@ -11,6 +11,8 @@ estimator/cmake-build-debug
 
 build
 build_docker
+install/
+log/
 
 data/
 
