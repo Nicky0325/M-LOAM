@@ -78,6 +78,7 @@ target_link_libraries(loop_closure_node
     ${catkin_LIBRARIES} ${OpenCV_LIBS} ${PCL_LIBRARIES} ${CERES_LIBRARIES} 
     ${GFLAGS_LIBRARIES} ${GLOG_LIBRARIES}
 )
+add_dependencies(loop_closure_node ${catkin_EXPORTED_TARGETS})
 
 ########################################### TEST ################
 add_executable(test_generate_data test/test_generate_data.cpp)
