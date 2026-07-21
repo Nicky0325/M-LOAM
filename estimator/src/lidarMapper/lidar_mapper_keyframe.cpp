@@ -585,9 +585,10 @@ void scan2MapOptimization()
             e_option.residual_blocks = res_ids_proj;
             ceres::CRSMatrix jaco;
             problem.Evaluate(e_option, nullptr, nullptr, nullptr, &jaco);
-            Eigen::Matrix<double, 6, 6> mat_H; // mat_H / 134 = normlized_mat_H
+            Eigen::Matrix<double, 6, 6> mat_H = Eigen::Matrix<double, 6, 6>::Zero(); // mat_H / 134 = normlized_mat_H
             evalHessian(jaco, mat_H);
-            evalDegenracy(mat_H, local_parameterization); // the hessian matrix is already normized to evaluate degeneracy
+            if (!res_ids_proj.empty())
+                evalDegenracy(mat_H, local_parameterization); // the hessian matrix is already normized to evaluate degeneracy
             // evalDegenracy(mat_H / 25, local_parameterization); // the hessian matrix is already normized to evaluate degeneracy
 
             // *********************************************************
@@ -612,10 +613,16 @@ void scan2MapOptimization()
                     common::timing::Timer eval_deg_timer("mapping_eval_deg");
                     problem.Evaluate(e_option, nullptr, nullptr, nullptr, &jaco);
                     evalHessian(jaco, mat_H);
-                    if (pose_keyframes_6d.size() <= 10)
+                    if (pose_keyframes_6d.size() <= 10 || res_ids_proj.empty() || !mat_H.allFinite())
                         cov_mapping.setZero();
                     else
-                        cov_mapping = (mat_H).inverse();
+                    {
+                        Eigen::LDLT<Eigen::Matrix<double, 6, 6> > ldlt(mat_H);
+                        if (ldlt.info() == Eigen::Success && ldlt.isPositive())
+                            cov_mapping = ldlt.solve(Eigen::Matrix<double, 6, 6>::Identity());
+                        else
+                            cov_mapping.setZero();
+                    }
 
                     double tr = cov_mapping.trace();
                     std::vector<double> sp{tr};
@@ -1168,6 +1175,7 @@ void cloudUCTAssociateToMap(const PointICovCloud &cloud_local,
 void evalHessian(const ceres::CRSMatrix &jaco, Eigen::Matrix<double, 6, 6> &mat_H)
 {
 	// printf("jacob: %d constraints, %d parameters\n", jaco.num_rows, jaco.num_cols); // 2000+, 6
+	mat_H.setZero();
 	if (jaco.num_rows == 0) return;
 	Eigen::SparseMatrix<double, Eigen::RowMajor> mat_J; // Jacobian is a diagonal matrix
 	CRSMatrix2EigenMatrix(jaco, mat_J);

@@ -26,14 +26,14 @@ struct RgbPoint {
   std::uint8_t r = 0;
   std::uint8_t g = 0;
   std::uint8_t b = 0;
-  std::string lidar_name;
+  std::uint8_t lidar_index = 0;
 };
 
 class LidarMapper {
  public:
   LidarMapper(std::vector<LidarConfig> lidars, double voxel_size);
 
-  void processFrame(const MappingFrame& frame);
+  void processFrame(MappingFrame frame);
   const std::vector<SensorKeyframe>& keyframes(
       const std::string& lidar_name) const;
   std::vector<RgbPoint> buildOnlineRgbMap() const;
@@ -42,6 +42,7 @@ class LidarMapper {
 
  private:
   std::vector<std::string> lidar_order_;
+  std::map<std::string, std::uint8_t> lidar_indices_;
   std::map<std::string, Rgb> colors_;
   std::map<std::string, std::vector<SensorKeyframe>> keyframes_;
   double voxel_size_;

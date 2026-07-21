@@ -58,10 +58,10 @@ void writeTransform(std::ostream& stream, const RigidTransform& transform) {
 }
 
 pcl::PointCloud<pcl::PointXYZRGB> coloredCloud(
-    const std::vector<RgbPoint>& points, const std::string* lidar_filter) {
+    const std::vector<RgbPoint>& points, const std::uint8_t* lidar_filter) {
   pcl::PointCloud<pcl::PointXYZRGB> cloud;
   for (const auto& point : points) {
-    if (lidar_filter != nullptr && point.lidar_name != *lidar_filter) continue;
+    if (lidar_filter != nullptr && point.lidar_index != *lidar_filter) continue;
     pcl::PointXYZRGB output_point;
     output_point.x = point.x;
     output_point.y = point.y;
@@ -77,7 +77,7 @@ pcl::PointCloud<pcl::PointXYZRGB> coloredCloud(
 }
 
 void saveColored(const std::string& path, const std::vector<RgbPoint>& points,
-                 const std::string* lidar_filter = nullptr) {
+                 const std::uint8_t* lidar_filter = nullptr) {
   const auto cloud = coloredCloud(points, lidar_filter);
   if (cloud.empty()) {
     auto stream = output(path);
@@ -128,13 +128,14 @@ std::pair<double, double> alignmentMetrics(
   }
   std::vector<double> distances;
   for (const auto& voxel : voxels) {
-    std::set<std::string> sensors;
-    for (const auto index : voxel.second) sensors.insert(points[index].lidar_name);
+    std::set<std::uint8_t> sensors;
+    for (const auto index : voxel.second)
+      sensors.insert(points[index].lidar_index);
     if (sensors.size() < 2) continue;
     for (const auto i : voxel.second) {
       double nearest = std::numeric_limits<double>::infinity();
       for (const auto j : voxel.second) {
-        if (points[i].lidar_name == points[j].lidar_name) continue;
+        if (points[i].lidar_index == points[j].lidar_index) continue;
         const double dx = points[i].x - points[j].x;
         const double dy = points[i].y - points[j].y;
         const double dz = points[i].z - points[j].z;
@@ -177,8 +178,12 @@ void RunArtifacts::addOnlineFeatures(
     const RigidTransform& world_T_reference,
     const std::map<std::string, std::vector<EncodedPointXYZI>>& features,
     const std::vector<LidarConfig>& lidars) {
+  std::size_t lidar_index = 0;
   for (const auto& lidar : lidars) {
     if (!lidar.enabled) continue;
+    if (lidar_index >= 256)
+      throw std::invalid_argument("at most 256 LiDARs are supported");
+    const auto compact_index = static_cast<std::uint8_t>(lidar_index++);
     const auto sensor_features = features.find(lidar.name);
     if (sensor_features == features.end()) continue;
     for (const auto& point : sensor_features->second) {
@@ -188,7 +193,7 @@ void RunArtifacts::addOnlineFeatures(
       online_features_.push_back(
           {static_cast<float>(world.x()), static_cast<float>(world.y()),
            static_cast<float>(world.z()), lidar.color.r, lidar.color.g,
-           lidar.color.b, lidar.name});
+           lidar.color.b, compact_index});
     }
   }
 }
@@ -264,6 +269,30 @@ void RunArtifacts::write(
     resolved << "]\n";
   }
 
+  const auto reference = std::find_if(
+      manifest.lidars.begin(), manifest.lidars.end(),
+      [&](const LidarConfig& lidar) {
+        return lidar.name == manifest.reference_lidar;
+      });
+  if (reference == manifest.lidars.end())
+    throw std::runtime_error("cannot resolve reference LiDAR for artifacts");
+  auto optimized = output(output_directory + "/optimized_extrinsics.yaml");
+  optimized << "convention: [tx, ty, tz, qx, qy, qz, qw]\n"
+            << "reference_lidar: " << manifest.reference_lidar << '\n'
+            << "reference_T_lidar:\n";
+  for (const auto& item : final_extrinsics) {
+    optimized << "  " << item.first << ": [";
+    writeTransform(optimized, item.second);
+    optimized << "]\n";
+  }
+  optimized << "vehicle_T_lidar:\n";
+  for (const auto& item : final_extrinsics) {
+    optimized << "  " << item.first << ": [";
+    writeTransform(optimized,
+                   reference->vehicle_T_lidar * item.second);
+    optimized << "]\n";
+  }
+
   auto sync = output(output_directory + "/synchronization.csv");
   sync << "frame,timestamp,status,reason,max_raw_skew_s,max_corrected_skew_s\n";
   for (const auto& record : synchronization_) {
@@ -312,10 +341,12 @@ void RunArtifacts::write(
               online_features_);
   saveColored(output_directory + "/map_merged_rgb.pcd", online_map);
   saveColored(output_directory + "/map_final_rgb.pcd", final_map);
+  std::size_t lidar_index = 0;
   for (const auto& lidar : manifest.lidars) {
     if (!lidar.enabled) continue;
+    const auto compact_index = static_cast<std::uint8_t>(lidar_index++);
     saveColored(output_directory + "/map_" + lidar.name + ".pcd",
-                final_map, &lidar.name);
+                final_map, &compact_index);
     for (const auto& keyframe : mapper.keyframes(lidar.name)) {
       std::ostringstream filename;
       filename << output_directory << "/keyframes/" << lidar.name << '/'

@@ -46,6 +46,11 @@ ScenarioConfiguration makeScenario(const OfflineManifest& manifest,
     result.estimator_mode = 0;
     return result;
   }
+  if (scenario == CalibrationScenario::kCalibratedInit) {
+    result.name = "calibrated_init";
+    result.estimator_mode = 1;
+    return result;
+  }
   if (scenario == CalibrationScenario::kPriorFree) {
     result.name = "prior_free";
     result.estimator_mode = 2;

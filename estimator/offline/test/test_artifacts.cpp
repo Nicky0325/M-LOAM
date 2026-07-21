@@ -5,6 +5,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <utility>
 
 #include "mloam/offline/artifacts.hpp"
 
@@ -63,7 +64,7 @@ TEST(Artifacts, WritesStableSchemasMapsAndPerSensorKeyframes) {
   frame.timestamp = 12.5;
   frame.lidars = {point("top"), point("side")};
   frame.reference_T_lidar = scenario.initial_extrinsics;
-  mapper.processFrame(frame);
+  mapper.processFrame(std::move(frame));
 
   offline::RunArtifacts artifacts;
   artifacts.addSynchronization({3, 12.5, "processed", "", 0.01, 0.02});
@@ -91,6 +92,7 @@ TEST(Artifacts, WritesStableSchemasMapsAndPerSensorKeyframes) {
   EXPECT_TRUE(exists(output + "/trajectory.csv"));
   EXPECT_TRUE(exists(output + "/extrinsics_history.csv"));
   EXPECT_TRUE(exists(output + "/observability_history.csv"));
+  EXPECT_TRUE(exists(output + "/optimized_extrinsics.yaml"));
   EXPECT_TRUE(exists(output + "/map_online_rgb.pcd"));
   EXPECT_TRUE(exists(output + "/map_online_features_rgb.pcd"));
   EXPECT_TRUE(exists(output + "/map_top.pcd"));
@@ -110,6 +112,9 @@ TEST(Artifacts, WritesStableSchemasMapsAndPerSensorKeyframes) {
                 .find("injected_perturbations:"));
   EXPECT_NE(std::string::npos,
             readFile(output + "/summary.yaml").find("convergence_frame:"));
+  EXPECT_NE(std::string::npos,
+            readFile(output + "/optimized_extrinsics.yaml")
+                .find("vehicle_T_lidar:"));
   const std::string synchronization_header =
       "frame,timestamp,status,reason,max_raw_skew_s,max_corrected_skew_s\n";
   EXPECT_EQ(synchronization_header,

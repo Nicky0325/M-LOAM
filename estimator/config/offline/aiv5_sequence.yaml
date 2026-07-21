@@ -1,0 +1,88 @@
+dataset_root: /home/biaoding2/datasets/aiv5_sequence_extraction
+output_root: /home/biaoding2/datasets/aiv5_sequence_extraction/mloam_results
+mloam_config: /home/biaoding2/repos/M-LOAM/estimator/config/config_aiv5_offline.yaml
+reference_lidar: lidar_fll_at128
+synchronization_threshold: 0.06
+frame_begin: 0
+frame_end: 760
+frame_stride: 1
+minimum_finite_ratio: 0.10
+
+lidars:
+  - name: lidar_fll_at128
+    enabled: true
+    directory: lidar/lidar_fll_at128
+    rings: 128
+    horizontal_fov_deg: 120
+    expected_width: 1300
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    time_offset: 0.0
+    segment_cloud: false
+    color: [230, 25, 75]
+    extrinsic_prototxt: /home/biaoding2/datasets/aiv5_sequence_extraction/calibration/lidar/lidar_fll_at128.prototxt
+
+  - name: lidar_frf_at128
+    enabled: true
+    directory: lidar/lidar_frf_at128
+    rings: 128
+    horizontal_fov_deg: 120
+    expected_width: 1300
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    time_offset: 0.0
+    segment_cloud: false
+    color: [60, 180, 75]
+    extrinsic_prototxt: /home/biaoding2/datasets/aiv5_sequence_extraction/calibration/lidar/lidar_frf_at128.prototxt
+
+  - name: lidar_brr_at128
+    enabled: true
+    directory: lidar/lidar_brr_at128
+    rings: 128
+    horizontal_fov_deg: 120
+    expected_width: 1300
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    time_offset: 0.0
+    segment_cloud: false
+    color: [255, 225, 25]
+    extrinsic_prototxt: /home/biaoding2/datasets/aiv5_sequence_extraction/calibration/lidar/lidar_brr_at128.prototxt
+
+  - name: lidar_blb_at128
+    enabled: true
+    directory: lidar/lidar_blb_at128
+    rings: 128
+    horizontal_fov_deg: 120
+    expected_width: 1300
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    time_offset: 0.0
+    segment_cloud: false
+    color: [0, 130, 200]
+    extrinsic_prototxt: /home/biaoding2/datasets/aiv5_sequence_extraction/calibration/lidar/lidar_blb_at128.prototxt
+
+  - name: lidar_fr_xt32
+    enabled: true
+    directory: lidar/lidar_fr_xt32
+    rings: 32
+    horizontal_fov_deg: 360
+    expected_width: 2000
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    time_offset: 0.0
+    segment_cloud: false
+    color: [245, 130, 48]
+    extrinsic_prototxt: /home/biaoding2/datasets/aiv5_sequence_extraction/calibration/lidar/lidar_fr_xt32.prototxt
+
+  - name: lidar_bl_xt32
+    enabled: true
+    directory: lidar/lidar_bl_xt32
+    rings: 32
+    horizontal_fov_deg: 360
+    expected_width: 2000
+    timestamp_scale: 2.0e-6
+    scan_period: 0.1
+    time_offset: 0.0
+    segment_cloud: false
+    color: [145, 30, 180]
+    extrinsic_prototxt: /home/biaoding2/datasets/aiv5_sequence_extraction/calibration/lidar/lidar_bl_xt32.prototxt

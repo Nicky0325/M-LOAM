@@ -16,7 +16,8 @@ std::string writePcd(const std::string& name, std::size_t width,
   const std::string path = "/tmp/" + name;
   std::ofstream stream(path);
   stream << "# .PCD v0.7\nVERSION 0.7\nFIELDS " << fields << "\n";
-  if (fields == "x y z reflectivity ring timestamp") {
+  if (fields == "x y z reflectivity ring timestamp" ||
+      fields == "x y z intensity ring timestamp") {
     stream << "SIZE 4 4 4 4 2 4\nTYPE F F F F U U\nCOUNT 1 1 1 1 1 1\n";
   } else {
     stream << "SIZE 4 4 4 4 4\nTYPE F F F F U\nCOUNT 1 1 1 1 1\n";
@@ -66,6 +67,16 @@ TEST(PcdPreprocessor, PreservesReflectivityTimeRingAndOrganizedOrder) {
               1e-7f);
   EXPECT_EQ((std::vector<std::size_t>{0, 4}), prepared.ring_start_indices);
   EXPECT_EQ((std::vector<std::size_t>{3, 7}), prepared.ring_end_indices);
+}
+
+TEST(PcdPreprocessor, AcceptsIntensityAliasAndClampsSmallTimeOvershoot) {
+  std::string points = kOrganizedPoints;
+  points.replace(points.find("10 1 3"), 6, "10 1 50500");
+  const auto path = writePcd("native_intensity.pcd", 4, 2, points,
+                             "x y z intensity ring timestamp");
+  const auto prepared = offline::preparePcd(path, config(), 1.0);
+  EXPECT_FLOAT_EQ(10.0f, prepared.native_points[0].reflectivity);
+  EXPECT_DOUBLE_EQ(0.1, prepared.native_points[0].timestamp);
 }
 
 TEST(PcdPreprocessor, FiltersNanButEnforcesFiniteRatio) {

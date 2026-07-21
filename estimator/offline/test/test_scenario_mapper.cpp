@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <utility>
+
 #include "mloam/offline/lidar_mapper.hpp"
 #include "mloam/offline/scenario.hpp"
 
@@ -68,10 +70,16 @@ TEST(Scenario, ProducesDeterministicExactMagnitudeCoarsePerturbations) {
 TEST(Scenario, PreciseAndPriorFreeSelectExpectedEstimatorModes) {
   const auto precise = offline::makeScenario(manifest(),
       offline::CalibrationScenario::kPrecise, 42, 0);
+  const auto calibrated = offline::makeScenario(manifest(),
+      offline::CalibrationScenario::kCalibratedInit, 42, 0);
   const auto prior = offline::makeScenario(manifest(),
       offline::CalibrationScenario::kPriorFree, 42, 0);
   EXPECT_EQ(0, precise.estimator_mode);
+  EXPECT_EQ(1, calibrated.estimator_mode);
   EXPECT_EQ(2, prior.estimator_mode);
+  EXPECT_EQ("calibrated_init", calibrated.name);
+  EXPECT_TRUE(calibrated.initial_extrinsics.at("side").translation.isApprox(
+      precise.initial_extrinsics.at("side").translation));
   EXPECT_DOUBLE_EQ(1.0,
       precise.initial_extrinsics.at("side").translation.x());
   EXPECT_TRUE(prior.initial_extrinsics.at("side").translation.isZero());
@@ -107,7 +115,7 @@ TEST(LidarMapper, PreservesProvenanceAndRebuildsWithFinalExtrinsics) {
   frame.lidars = {onePoint("top", 0.0f), onePoint("side", 0.0f)};
   frame.reference_T_lidar["top"] = offline::RigidTransform();
   frame.reference_T_lidar["side"].translation = Eigen::Vector3d(5, 0, 0);
-  mapper.processFrame(frame);
+  mapper.processFrame(std::move(frame));
 
   EXPECT_EQ(1u, mapper.keyframes("top").size());
   EXPECT_EQ(1u, mapper.keyframes("side").size());
@@ -121,4 +129,6 @@ TEST(LidarMapper, PreservesProvenanceAndRebuildsWithFinalExtrinsics) {
   EXPECT_FLOAT_EQ(1.0f, map[1].x);
   EXPECT_EQ(255, map[0].r);
   EXPECT_EQ(255, map[1].g);
+  EXPECT_EQ(0, map[0].lidar_index);
+  EXPECT_EQ(1, map[1].lidar_index);
 }

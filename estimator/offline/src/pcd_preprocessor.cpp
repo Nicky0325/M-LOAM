@@ -28,6 +28,23 @@ const pcl::PCLPointField& requiredField(const pcl::PCLPointCloud2& cloud,
   return *it;
 }
 
+const pcl::PCLPointField& reflectivityField(
+    const pcl::PCLPointCloud2& cloud) {
+  const auto find = [&](const std::string& name) {
+    return std::find_if(
+        cloud.fields.begin(), cloud.fields.end(),
+        [&](const pcl::PCLPointField& field) {
+          return field.name == name && field.count == 1;
+        });
+  };
+  const auto reflectivity = find("reflectivity");
+  if (reflectivity != cloud.fields.end()) return *reflectivity;
+  const auto intensity = find("intensity");
+  if (intensity != cloud.fields.end()) return *intensity;
+  throw PcdValidationError(
+      "required scalar PCD field is missing: reflectivity or intensity");
+}
+
 double numericValue(const std::uint8_t* point,
                     const pcl::PCLPointField& field) {
   const std::uint8_t* data = point + field.offset;
@@ -207,7 +224,7 @@ PreparedLidarFrame preparePcd(const std::string& path,
   const auto& x_field = requiredField(cloud, "x");
   const auto& y_field = requiredField(cloud, "y");
   const auto& z_field = requiredField(cloud, "z");
-  const auto& reflectivity_field = requiredField(cloud, "reflectivity");
+  const auto& reflectivity_field = reflectivityField(cloud);
   const auto& ring_field = requiredField(cloud, "ring");
   const auto& timestamp_field = requiredField(cloud, "timestamp");
 
@@ -239,10 +256,15 @@ PreparedLidarFrame preparePcd(const std::string& path,
         ++result.discarded_non_finite;
         continue;
       }
-      if (native.timestamp < 0.0 || native.timestamp > config.scan_period) {
+      // Some AIV XT32 scans carry one column up to about 1 ms beyond the
+      // nominal revolution boundary. Treat that as end-of-scan quantization.
+      constexpr double kTimestampToleranceSeconds = 2e-3;
+      if (native.timestamp < 0.0 ||
+          native.timestamp > config.scan_period + kTimestampToleranceSeconds) {
         throw PcdValidationError(
             "scaled timestamp is outside the configured scan period");
       }
+      native.timestamp = std::min(native.timestamp, config.scan_period);
       native.ring = ringValue(point, ring_field, config.ring_count);
       result.native_points.push_back(native);
     }

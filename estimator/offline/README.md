@@ -9,6 +9,8 @@ publishers.
 This guide covers dataset preparation, manifest configuration, benchmark runs,
 and the generated results. The six-LiDAR template is
 [`../config/offline/example_six_lidar.yaml`](../config/offline/example_six_lidar.yaml).
+The checked AIV5 sequence configuration is
+[`../config/offline/aiv5_sequence.yaml`](../config/offline/aiv5_sequence.yaml).
 
 ## 1. Build and set up the environment
 
@@ -60,14 +62,15 @@ other enabled LiDAR within `synchronization_threshold`.
 Each PCD must:
 
 - Be organized with `WIDTH == expected_width` and `HEIGHT == rings`.
-- Contain scalar fields named `x`, `y`, `z`, `reflectivity`, `ring`, and
-  `timestamp`.
+- Contain scalar fields named `x`, `y`, `z`, `ring`, and `timestamp`, plus
+  either `reflectivity` or its accepted alias `intensity`.
 - Store `ring` as an unsigned integer in the range `[0, rings)`.
 - Preserve the sensor's native organized column order. M-LOAM uses the supplied
   ring and point time; it does not derive them from angles.
 - Have at least `minimum_finite_ratio` finite XYZ points.
 - Have point timestamps which, after multiplication by `timestamp_scale`, lie
-  in `[0, scan_period]` seconds.
+  in `[0, scan_period]` seconds. Values no more than 2 ms past the configured
+  period are clamped to the period to tolerate sensor quantization.
 
 For sensors whose point timestamp unit is 2 microseconds, use
 `timestamp_scale: 2.0e-6`. The runner supports mixed geometries, such as a
@@ -171,7 +174,8 @@ prototxt format:
 
 Relative `extrinsic_prototxt` paths are resolved relative to the manifest file.
 The prototxt translation and rotation are also interpreted as
-`vehicle_T_lidar`.
+`vehicle_T_lidar`. Both the legacy `rotation { roll, pitch, yaw }` form and the
+AIV `rotation_rpy_deg { x, y, z }` form are supported.
 
 ## 4. Run the sequence
 
@@ -194,6 +198,15 @@ Run the full precise baseline:
 rosrun mloam mloam_offline_runner \
   --manifest estimator/config/offline/my_sequence.yaml \
   --scenario precise
+```
+
+To trust the calibration folder as the initial estimate and then optimize the
+non-reference extrinsics online, run:
+
+```bash
+rosrun mloam mloam_offline_runner \
+  --manifest estimator/config/offline/my_sequence.yaml \
+  --scenario calibrated_init
 ```
 
 Run all deterministic coarse-initialization levels:
@@ -223,7 +236,8 @@ rosrun mloam mloam_offline_runner \
   --scenario prior_free --seed 42
 ```
 
-Or run the precise, all three coarse, and prior-free scenarios together:
+Or run precise, calibrated-init, all three coarse, and prior-free scenarios
+together:
 
 ```bash
 rosrun mloam mloam_offline_runner \
@@ -256,6 +270,7 @@ Results are written below the manifest's `output_root`, or the path supplied by
 ```text
 <output_root>/
 ├── precise/
+├── calibrated_init/
 ├── coarse_5deg_0.25m/
 ├── coarse_15deg_0.75m/
 ├── coarse_30deg_1.5m/
@@ -272,6 +287,7 @@ Each scenario directory contains:
 | `runtime.csv` | Per-frame preprocessing, odometry, and mapping time in milliseconds. |
 | `features.csv` | Per-frame, per-LiDAR corner and surface feature counts. |
 | `trajectory.csv` | Estimated world pose of the reference LiDAR as translation plus XYZW quaternion. |
+| `optimized_extrinsics.yaml` | Final transforms in both `reference_T_lidar` and `vehicle_T_lidar` convention. |
 | `extrinsics_history.csv` | Per-frame `reference_T_lidar`, rotation/translation error, and calibration state. |
 | `observability_history.csv` | Per-frame observability flag and calibration state for each non-reference LiDAR. |
 | `map_online_rgb.pcd` | Map accumulated with the extrinsics available online at each keyframe. |
@@ -292,12 +308,30 @@ The process exit status is:
 - `2`: at least one scenario did not converge, but valid artifacts were kept.
 - `1`: configuration or execution failure.
 
+For an AIV5 session that also contains `vehicle_pose/*.prototxt`, generate ATE,
+RPE, aligned vehicle odometry, calibration, map, feature, synchronization, and
+runtime metrics with:
+
+```bash
+python3 estimator/offline/tools/evaluate_aiv5_session.py \
+  --manifest estimator/config/offline/aiv5_sequence.yaml \
+  --session-root /data/mloam_results/my_session \
+  --scenarios precise calibrated_init prior_free
+```
+
+This writes `odometry_metrics.yaml` and
+`trajectory_vehicle_aligned.csv` in each scenario plus
+`session_metrics.yaml` and `session_report.md` at the session root. The
+evaluator applies a rigid SE(3), no-scale alignment and labels the supplied DR
+vehicle pose as a reference rather than surveyed ground truth.
+
 ## 6. Benchmark scenarios consistently
 
-For a fair benchmark, keep the following identical across precise, coarse, and
-prior-free runs: manifest, included LiDARs, reference LiDAR, frame range,
-stride, synchronization threshold, fixed time offsets, algorithm config, and
-seed. Use a separate output root if an earlier run must be preserved.
+For a fair benchmark, keep the following identical across precise,
+calibrated-init, coarse, and prior-free runs: manifest, included LiDARs,
+reference LiDAR, frame range, stride, synchronization threshold, fixed time
+offsets, algorithm config, and seed. Use a separate output root if an earlier
+run must be preserved.
 
 Recommended comparison order:
 

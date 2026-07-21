@@ -113,7 +113,12 @@ struct MappingFrame {
   std::map<std::string, RigidTransform> reference_T_lidar;
 };
 
-enum class CalibrationScenario { kPrecise, kCoarse, kPriorFree };
+enum class CalibrationScenario {
+  kPrecise,
+  kCalibratedInit,
+  kCoarse,
+  kPriorFree
+};
 enum class CalibrationState {
   kInitializing,
   kObservable,

@@ -137,13 +137,15 @@ RunResult runOffline(const OfflineManifest& manifest,
                                 manifest.lidars);
 
     const auto mapping_begin = std::chrono::steady_clock::now();
-    MappingFrame mapping_frame;
-    mapping_frame.frame_index = synchronized_frame.reference_index;
-    mapping_frame.timestamp = synchronized_frame.reference_timestamp;
-    mapping_frame.world_T_reference = estimate.world_T_reference;
-    mapping_frame.lidars = prepared;
-    mapping_frame.reference_T_lidar = estimate.reference_T_lidar;
-    if (estimate.save_keyframe) mapper.processFrame(mapping_frame);
+    if (estimate.save_keyframe) {
+      MappingFrame mapping_frame;
+      mapping_frame.frame_index = synchronized_frame.reference_index;
+      mapping_frame.timestamp = synchronized_frame.reference_timestamp;
+      mapping_frame.world_T_reference = estimate.world_T_reference;
+      mapping_frame.lidars = std::move(prepared);
+      mapping_frame.reference_T_lidar = estimate.reference_T_lidar;
+      mapper.processFrame(std::move(mapping_frame));
+    }
     const double mapping_ms = (estimate.mapping_ms >= 0.0
                                    ? estimate.mapping_ms : 0.0) +
                               milliseconds(mapping_begin);

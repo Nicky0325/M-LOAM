@@ -14,14 +14,18 @@ LidarMapper::LidarMapper(std::vector<LidarConfig> lidars, double voxel_size)
   if (voxel_size_ <= 0.0) throw std::invalid_argument("voxel size must be positive");
   for (const auto& lidar : lidars) {
     if (!lidar.enabled) continue;
+    if (lidar_order_.size() >= 256)
+      throw std::invalid_argument("at most 256 LiDARs are supported");
+    lidar_indices_[lidar.name] =
+        static_cast<std::uint8_t>(lidar_order_.size());
     lidar_order_.push_back(lidar.name);
     colors_[lidar.name] = lidar.color;
     keyframes_[lidar.name] = {};
   }
 }
 
-void LidarMapper::processFrame(const MappingFrame& frame) {
-  for (const auto& lidar : frame.lidars) {
+void LidarMapper::processFrame(MappingFrame frame) {
+  for (auto& lidar : frame.lidars) {
     auto keyframes = keyframes_.find(lidar.lidar_name);
     if (keyframes == keyframes_.end())
       throw std::invalid_argument("mapping frame contains unknown LiDAR: " +
@@ -35,7 +39,7 @@ void LidarMapper::processFrame(const MappingFrame& frame) {
       throw std::invalid_argument("mapping frame is missing extrinsic for " +
                                   lidar.lidar_name);
     keyframe.reference_T_lidar_used = extrinsic->second;
-    keyframe.points = lidar.native_points;
+    keyframe.points = std::move(lidar.native_points);
     keyframes->second.push_back(std::move(keyframe));
   }
 }
@@ -60,7 +64,7 @@ std::vector<RgbPoint> LidarMapper::buildOnlineRgbMap() const {
         result.push_back({static_cast<float>(global.x()),
                           static_cast<float>(global.y()),
                           static_cast<float>(global.z()), color.r, color.g,
-                          color.b, lidar_name});
+                          color.b, lidar_indices_.at(lidar_name)});
       }
     }
   }
@@ -96,7 +100,7 @@ std::vector<RgbPoint> LidarMapper::rebuildFinalRgbMap(
         result.push_back({static_cast<float>(global.x()),
                           static_cast<float>(global.y()),
                           static_cast<float>(global.z()), color.r, color.g,
-                          color.b, lidar_name});
+                          color.b, lidar_indices_.at(lidar_name)});
       }
     }
   }

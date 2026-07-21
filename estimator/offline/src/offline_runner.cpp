@@ -52,7 +52,7 @@ std::vector<std::string> split(const std::string& value) {
 void usage(std::ostream& stream) {
   stream << "Usage: mloam_offline_runner --manifest FILE [options]\n"
          << "  --mloam-config FILE       legacy estimator algorithm config\n"
-         << "  --scenario NAME           precise|coarse|prior_free|all\n"
+         << "  --scenario NAME           precise|calibrated_init|coarse|prior_free|all\n"
          << "  --coarse-level LEVEL      0|1|2|all (default all)\n"
          << "  --include a,b --exclude c select LiDAR names\n"
          << "  --reference NAME          override reference LiDAR\n"
@@ -105,6 +105,10 @@ std::vector<offline::ScenarioConfiguration> scenarios(
   if (options.scenario == "precise" || options.scenario == "all")
     result.push_back(offline::makeScenario(
         manifest, offline::CalibrationScenario::kPrecise, options.seed, 0));
+  if (options.scenario == "calibrated_init" || options.scenario == "all")
+    result.push_back(offline::makeScenario(
+        manifest, offline::CalibrationScenario::kCalibratedInit,
+        options.seed, 0));
   if (options.scenario == "coarse" || options.scenario == "all") {
     for (const auto level : coarseLevels(options.coarse_level))
       result.push_back(offline::makeScenario(
@@ -114,7 +118,8 @@ std::vector<offline::ScenarioConfiguration> scenarios(
     result.push_back(offline::makeScenario(
         manifest, offline::CalibrationScenario::kPriorFree, options.seed, 0));
   if (result.empty())
-    throw std::invalid_argument("scenario must be precise, coarse, prior_free, or all");
+    throw std::invalid_argument(
+        "scenario must be precise, calibrated_init, coarse, prior_free, or all");
   return result;
 }
 

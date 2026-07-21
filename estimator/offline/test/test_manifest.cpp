@@ -134,3 +134,32 @@ lidars:
       Eigen::AngleAxisd(M_PI / 18.0, Eigen::Vector3d::UnitX());
   EXPECT_TRUE(parsed.lidars[0].vehicle_T_lidar.rotation.isApprox(expected));
 }
+
+TEST(Manifest, LoadsAivRotationRpyDegPrototxtExtrinsic) {
+  const std::string proto = "/tmp/mloam_aiv_extrinsic.prototxt";
+  std::ofstream(proto) <<
+      "vehicle_type: AIV\n"
+      "rotation_rpy_deg { x: 10 y: 20 z: 30 }\n"
+      "translation { x: 1 y: 2 z: 3 }\n";
+  const std::string yaml = R"yaml(
+dataset_root: /data
+output_root: /tmp/out
+reference_lidar: top
+lidars:
+  - name: top
+    directory: top
+    rings: 128
+    horizontal_fov_deg: 120
+    expected_width: 1300
+    color: [1, 2, 3]
+    extrinsic_prototxt: )yaml" + proto + "\n";
+  const auto parsed = offline::loadManifest(
+      writeManifest("mloam_aiv_prototxt_manifest.yaml", yaml));
+  const Eigen::Quaterniond expected =
+      Eigen::AngleAxisd(M_PI / 6.0, Eigen::Vector3d::UnitZ()) *
+      Eigen::AngleAxisd(M_PI / 9.0, Eigen::Vector3d::UnitY()) *
+      Eigen::AngleAxisd(M_PI / 18.0, Eigen::Vector3d::UnitX());
+  EXPECT_TRUE(parsed.lidars[0].vehicle_T_lidar.translation.isApprox(
+      Eigen::Vector3d(1, 2, 3)));
+  EXPECT_TRUE(parsed.lidars[0].vehicle_T_lidar.rotation.isApprox(expected));
+}

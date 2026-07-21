@@ -68,17 +68,25 @@ RigidTransform parsePrototxtTransform(const std::string& path) {
   if (!stream) throw std::invalid_argument("cannot open extrinsic prototxt: " + path);
   const std::string text((std::istreambuf_iterator<char>(stream)), {});
   const std::string translation = protoBlock(text, "translation");
-  const std::string rotation = protoBlock(text, "rotation");
   RigidTransform transform;
   transform.translation = {protoValue(translation, "x"),
                            protoValue(translation, "y"),
                            protoValue(translation, "z")};
-  const bool degrees = rotation.find("roll_deg") != std::string::npos;
-  const std::string suffix = degrees ? "_deg" : "";
-  Eigen::Vector3d rpy(protoValue(rotation, "roll" + suffix),
-                      protoValue(rotation, "pitch" + suffix),
-                      protoValue(rotation, "yaw" + suffix));
-  if (degrees) rpy *= M_PI / 180.0;
+  Eigen::Vector3d rpy;
+  if (text.find("rotation_rpy_deg") != std::string::npos) {
+    const std::string rotation = protoBlock(text, "rotation_rpy_deg");
+    rpy = Eigen::Vector3d(protoValue(rotation, "x"),
+                          protoValue(rotation, "y"),
+                          protoValue(rotation, "z")) * (M_PI / 180.0);
+  } else {
+    const std::string rotation = protoBlock(text, "rotation");
+    const bool degrees = rotation.find("roll_deg") != std::string::npos;
+    const std::string suffix = degrees ? "_deg" : "";
+    rpy = Eigen::Vector3d(protoValue(rotation, "roll" + suffix),
+                          protoValue(rotation, "pitch" + suffix),
+                          protoValue(rotation, "yaw" + suffix));
+    if (degrees) rpy *= M_PI / 180.0;
+  }
   transform.rotation = Eigen::AngleAxisd(rpy.z(), Eigen::Vector3d::UnitZ()) *
                        Eigen::AngleAxisd(rpy.y(), Eigen::Vector3d::UnitY()) *
                        Eigen::AngleAxisd(rpy.x(), Eigen::Vector3d::UnitX());
