@@ -24,6 +24,8 @@ struct Options {
   std::string mloam_config;
   std::string scenario = "precise";
   std::string coarse_level = "all";
+  std::vector<double> rotation_perturbations;
+  double translation_perturbation = 0.0;
   std::vector<std::string> include;
   std::vector<std::string> exclude;
   std::string reference;
@@ -52,8 +54,10 @@ std::vector<std::string> split(const std::string& value) {
 void usage(std::ostream& stream) {
   stream << "Usage: mloam_offline_runner --manifest FILE [options]\n"
          << "  --mloam-config FILE       legacy estimator algorithm config\n"
-         << "  --scenario NAME           precise|calibrated_init|coarse|prior_free|all\n"
+         << "  --scenario NAME           precise|calibrated_init|calibration_sweep|coarse|prior_free|all\n"
          << "  --coarse-level LEVEL      0|1|2|all (default all)\n"
+         << "  --rotation-perturbations D1,D2,...  calibration_sweep angles (degrees)\n"
+         << "  --translation-perturbation M       optional sweep translation magnitude (default 0)\n"
          << "  --include a,b --exclude c select LiDAR names\n"
          << "  --reference NAME          override reference LiDAR\n"
          << "  --begin N --end N --stride N\n"
@@ -78,6 +82,12 @@ Options parseOptions(int argc, char** argv) {
     else if (argument == "--mloam-config") options.mloam_config = value;
     else if (argument == "--scenario") options.scenario = value;
     else if (argument == "--coarse-level") options.coarse_level = value;
+    else if (argument == "--rotation-perturbations") {
+      for (const auto& item : split(value))
+        options.rotation_perturbations.push_back(std::stod(item));
+    }
+    else if (argument == "--translation-perturbation")
+      options.translation_perturbation = std::stod(value);
     else if (argument == "--include") options.include = split(value);
     else if (argument == "--exclude") options.exclude = split(value);
     else if (argument == "--reference") options.reference = value;
@@ -109,6 +119,15 @@ std::vector<offline::ScenarioConfiguration> scenarios(
     result.push_back(offline::makeScenario(
         manifest, offline::CalibrationScenario::kCalibratedInit,
         options.seed, 0));
+  if (options.scenario == "calibration_sweep") {
+    if (options.rotation_perturbations.empty())
+      throw std::invalid_argument(
+          "calibration_sweep requires --rotation-perturbations");
+    for (const double degrees : options.rotation_perturbations)
+      result.push_back(offline::makePerturbedCalibrationScenario(
+          manifest, options.seed, degrees,
+          options.translation_perturbation));
+  }
   if (options.scenario == "coarse" || options.scenario == "all") {
     for (const auto level : coarseLevels(options.coarse_level))
       result.push_back(offline::makeScenario(
@@ -119,7 +138,7 @@ std::vector<offline::ScenarioConfiguration> scenarios(
         manifest, offline::CalibrationScenario::kPriorFree, options.seed, 0));
   if (result.empty())
     throw std::invalid_argument(
-        "scenario must be precise, calibrated_init, coarse, prior_free, or all");
+        "scenario must be precise, calibrated_init, calibration_sweep, coarse, prior_free, or all");
   return result;
 }
 

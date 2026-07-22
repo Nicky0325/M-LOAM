@@ -28,6 +28,11 @@ ScenarioConfiguration makeScenario(const OfflineManifest& manifest,
                                    std::uint64_t seed,
                                    std::size_t coarse_level);
 
+ScenarioConfiguration makePerturbedCalibrationScenario(
+    const OfflineManifest& manifest, std::uint64_t seed,
+    double rotation_perturbation_deg,
+    double translation_perturbation_m = 0.0);
+
 struct CalibrationHistoryEntry {
   std::size_t frame = 0;
   double timestamp = 0.0;

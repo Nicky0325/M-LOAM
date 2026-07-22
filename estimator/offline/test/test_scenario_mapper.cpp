@@ -67,6 +67,30 @@ TEST(Scenario, ProducesDeterministicExactMagnitudeCoarsePerturbations) {
   EXPECT_TRUE(first.initial_extrinsics.at("top").translation.isZero());
 }
 
+TEST(Scenario, ProducesRotationOnlyCalibratedInitializationSweep) {
+  const auto one = offline::makePerturbedCalibrationScenario(
+      manifest(), 42, 1.0);
+  const auto ten = offline::makePerturbedCalibrationScenario(
+      manifest(), 42, 10.0);
+  const auto precise = offline::referenceRelativeExtrinsics(manifest());
+
+  EXPECT_EQ(1, one.estimator_mode);
+  EXPECT_EQ("calibrated_init_1deg_0m", one.name);
+  EXPECT_EQ("calibrated_init_10deg_0m", ten.name);
+  EXPECT_DOUBLE_EQ(0.0, one.translation_perturbation_m);
+  EXPECT_TRUE(one.initial_extrinsics.at("side").translation.isApprox(
+      precise.at("side").translation, 0.0));
+  EXPECT_NEAR(1.0,
+      rotationErrorDegrees(one.initial_extrinsics.at("side"),
+                           precise.at("side")), 1e-10);
+  EXPECT_NEAR(10.0,
+      rotationErrorDegrees(ten.initial_extrinsics.at("side"),
+                           precise.at("side")), 1e-10);
+  EXPECT_TRUE(one.injected_perturbations.at("side").translation.isZero());
+  EXPECT_TRUE(one.initial_extrinsics.at("top").rotation.isApprox(
+      precise.at("top").rotation));
+}
+
 TEST(Scenario, PreciseAndPriorFreeSelectExpectedEstimatorModes) {
   const auto precise = offline::makeScenario(manifest(),
       offline::CalibrationScenario::kPrecise, 42, 0);

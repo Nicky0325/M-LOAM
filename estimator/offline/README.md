@@ -209,6 +209,23 @@ rosrun mloam mloam_offline_runner \
   --scenario calibrated_init
 ```
 
+To measure angular recovery around the trusted calibration without coupling in
+translation error, run a deterministic rotation-only sweep:
+
+```bash
+rosrun mloam mloam_offline_runner \
+  --manifest estimator/config/offline/aiv5_sequence.yaml \
+  --scenario calibration_sweep \
+  --rotation-perturbations 1,3,5,10 --seed 42
+```
+
+Every non-reference LiDAR receives its own deterministic random rotation axis;
+the axis stays fixed across sweep levels so increasing angles are directly
+comparable. Translation remains unchanged unless
+`--translation-perturbation` is supplied. Outputs use directories such as
+`calibrated_init_3deg_0m/` and include the injected transform, extrinsic
+history, optimized extrinsics, odometry, and local/final maps.
+
 Run all deterministic coarse-initialization levels:
 
 ```bash

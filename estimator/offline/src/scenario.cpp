@@ -1,9 +1,12 @@
 #include "mloam/offline/scenario.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <functional>
+#include <iomanip>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 
 namespace mloam {
@@ -26,6 +29,35 @@ std::uint64_t nameSeed(std::uint64_t seed, const std::string& name) {
     value *= 1099511628211ULL;
   }
   return value;
+}
+
+std::string magnitudeName(double value) {
+  std::ostringstream stream;
+  stream << std::fixed << std::setprecision(3) << value;
+  std::string result = stream.str();
+  while (result.size() > 1 && result.back() == '0') result.pop_back();
+  if (!result.empty() && result.back() == '.') result.pop_back();
+  std::replace(result.begin(), result.end(), '.', 'p');
+  return result;
+}
+
+void perturbNonReferenceExtrinsics(const OfflineManifest& manifest,
+                                   ScenarioConfiguration& scenario) {
+  for (auto& item : scenario.initial_extrinsics) {
+    if (item.first == manifest.reference_lidar) continue;
+    std::mt19937_64 generator(nameSeed(scenario.seed, item.first));
+    const Eigen::Vector3d rotation_axis = randomUnitVector(generator);
+    const Eigen::Vector3d translation_direction = randomUnitVector(generator);
+    RigidTransform perturbation;
+    perturbation.rotation = Eigen::AngleAxisd(
+        scenario.rotation_perturbation_deg * M_PI / 180.0, rotation_axis);
+    perturbation.translation =
+        translation_direction * scenario.translation_perturbation_m;
+    item.second.rotation = item.second.rotation * perturbation.rotation;
+    item.second.rotation.normalize();
+    item.second.translation += perturbation.translation;
+    scenario.injected_perturbations[item.first] = perturbation;
+  }
 }
 
 }  // namespace
@@ -70,21 +102,34 @@ ScenarioConfiguration makeScenario(const OfflineManifest& manifest,
                 "deg_" +
                 (coarse_level == 0 ? "0.25" : coarse_level == 1 ? "0.75" : "1.5") +
                 "m";
-  for (auto& item : result.initial_extrinsics) {
-    if (item.first == manifest.reference_lidar) continue;
-    std::mt19937_64 generator(nameSeed(seed, item.first));
-    const Eigen::Vector3d rotation_axis = randomUnitVector(generator);
-    const Eigen::Vector3d translation_direction = randomUnitVector(generator);
-    RigidTransform perturbation;
-    perturbation.rotation = Eigen::AngleAxisd(
-        result.rotation_perturbation_deg * M_PI / 180.0, rotation_axis);
-    perturbation.translation =
-        translation_direction * result.translation_perturbation_m;
-    item.second.rotation = item.second.rotation * perturbation.rotation;
-    item.second.rotation.normalize();
-    item.second.translation += perturbation.translation;
-    result.injected_perturbations[item.first] = perturbation;
+  perturbNonReferenceExtrinsics(manifest, result);
+  return result;
+}
+
+ScenarioConfiguration makePerturbedCalibrationScenario(
+    const OfflineManifest& manifest, std::uint64_t seed,
+    double rotation_perturbation_deg, double translation_perturbation_m) {
+  if (!std::isfinite(rotation_perturbation_deg) ||
+      rotation_perturbation_deg < 0.0 || rotation_perturbation_deg > 180.0) {
+    throw std::invalid_argument(
+        "rotation perturbation must be finite and in [0, 180] degrees");
   }
+  if (!std::isfinite(translation_perturbation_m) ||
+      translation_perturbation_m < 0.0) {
+    throw std::invalid_argument(
+        "translation perturbation must be finite and non-negative");
+  }
+  ScenarioConfiguration result;
+  result.seed = seed;
+  result.scenario = CalibrationScenario::kCoarse;
+  result.estimator_mode = 1;
+  result.rotation_perturbation_deg = rotation_perturbation_deg;
+  result.translation_perturbation_m = translation_perturbation_m;
+  result.name = "calibrated_init_" + magnitudeName(rotation_perturbation_deg) +
+                "deg_" + magnitudeName(translation_perturbation_m) + "m";
+  result.precise_extrinsics = referenceRelativeExtrinsics(manifest);
+  result.initial_extrinsics = result.precise_extrinsics;
+  perturbNonReferenceExtrinsics(manifest, result);
   return result;
 }
 

@@ -223,6 +223,10 @@ void RunArtifacts::write(
            << "scenario: " << scenario.name << '\n'
            << "estimator_mode: " << scenario.estimator_mode << '\n'
            << "seed: " << scenario.seed << '\n'
+           << "rotation_perturbation_deg: "
+           << scenario.rotation_perturbation_deg << '\n'
+           << "translation_perturbation_m: "
+           << scenario.translation_perturbation_m << '\n'
            << "injected_perturbations:\n";
   for (const auto& item : scenario.injected_perturbations) {
     resolved << "  " << item.first << ": [";
