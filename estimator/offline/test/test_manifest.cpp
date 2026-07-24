@@ -78,6 +78,39 @@ TEST(Manifest, ComputesReferenceRelativeTransforms) {
       vehicle_R_top.conjugate() * Eigen::Vector3d::UnitX(), 1e-12));
 }
 
+TEST(Manifest, ParsesAndValidatesJointBackend) {
+  std::string yaml = kTwoLidarManifest;
+  yaml += R"yaml(
+joint_backend:
+  enabled: true
+  mode: coarse_bootstrap
+  initial_voxel_size: 3.0
+  minimum_voxel_size: 0.25
+  minimum_keyframes: 4
+  maximum_keyframes: 12
+  bootstrap_frames: 20
+  minimum_heldout_improvement: 0.01
+)yaml";
+  const auto manifest = offline::loadManifest(
+      writeManifest("mloam_joint_backend.yaml", yaml));
+  EXPECT_TRUE(manifest.joint_backend.enabled);
+  EXPECT_EQ(offline::JointBackendMode::kCoarseBootstrap,
+            manifest.joint_backend.mode);
+  EXPECT_DOUBLE_EQ(3.0, manifest.joint_backend.initial_voxel_size);
+  EXPECT_EQ(20u, manifest.joint_backend.bootstrap_frames);
+  auto single_lidar = manifest;
+  EXPECT_THROW(offline::applyLidarSelection(single_lidar, {"top"}, {}),
+               std::invalid_argument);
+
+  const auto invalid = yaml + R"yaml(
+  heldout_fraction: 0.75
+)yaml";
+  EXPECT_THROW(
+      offline::loadManifest(
+          writeManifest("mloam_joint_backend_invalid.yaml", invalid)),
+      std::invalid_argument);
+}
+
 TEST(Manifest, RejectsDuplicateNamesAndMissingReference) {
   std::string duplicate = kTwoLidarManifest;
   const auto side = duplicate.find("name: side");

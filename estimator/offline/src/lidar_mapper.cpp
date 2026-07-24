@@ -107,5 +107,84 @@ std::vector<RgbPoint> LidarMapper::rebuildFinalRgbMap(
   return result;
 }
 
+RigidTransform LidarMapper::correctedReferencePose(
+    std::size_t frame_index, const RigidTransform& original_pose,
+    const std::map<std::size_t, RigidTransform>& optimized_keyframe_poses)
+    const {
+  if (optimized_keyframe_poses.empty()) return original_pose;
+  const auto exact = optimized_keyframe_poses.find(frame_index);
+  if (exact != optimized_keyframe_poses.end()) return exact->second;
+  std::map<std::size_t, RigidTransform> original_anchors;
+  for (const auto& lidar_name : lidar_order_) {
+    for (const auto& keyframe : keyframes_.at(lidar_name)) {
+      if (optimized_keyframe_poses.count(keyframe.frame_index) != 0)
+        original_anchors[keyframe.frame_index] = keyframe.world_T_reference;
+    }
+    if (original_anchors.size() == optimized_keyframe_poses.size()) break;
+  }
+  if (original_anchors.empty()) return original_pose;
+  auto upper = optimized_keyframe_poses.lower_bound(frame_index);
+  auto lower = upper;
+  if (lower != optimized_keyframe_poses.begin()) --lower;
+  if (upper == optimized_keyframe_poses.end()) upper = lower;
+  if (upper == optimized_keyframe_poses.begin() && upper->first > frame_index)
+    lower = upper;
+
+  const auto correction = [&](const auto& anchor) {
+    return anchor->second * original_anchors.at(anchor->first).inverse();
+  };
+  const RigidTransform lower_correction = correction(lower);
+  if (lower->first == upper->first)
+    return lower_correction * original_pose;
+  const RigidTransform upper_correction = correction(upper);
+  const double fraction =
+      static_cast<double>(frame_index - lower->first) /
+      static_cast<double>(upper->first - lower->first);
+  RigidTransform interpolated;
+  interpolated.translation =
+      (1.0 - fraction) * lower_correction.translation +
+      fraction * upper_correction.translation;
+  interpolated.rotation =
+      lower_correction.rotation.slerp(fraction, upper_correction.rotation);
+  interpolated.rotation.normalize();
+  return interpolated * original_pose;
+}
+
+std::vector<RgbPoint> LidarMapper::rebuildCorrectedRgbMap(
+    const std::map<std::string, RigidTransform>& final_extrinsics,
+    const std::map<std::size_t, RigidTransform>& optimized_keyframe_poses)
+    const {
+  std::vector<RgbPoint> result;
+  for (const auto& lidar_name : lidar_order_) {
+    const auto extrinsic = final_extrinsics.find(lidar_name);
+    if (extrinsic == final_extrinsics.end())
+      throw std::invalid_argument("final extrinsic missing for " + lidar_name);
+    std::set<std::tuple<long long, long long, long long>> occupied_voxels;
+    for (const auto& keyframe : keyframes_.at(lidar_name)) {
+      const RigidTransform world_T_reference = correctedReferencePose(
+          keyframe.frame_index, keyframe.world_T_reference,
+          optimized_keyframe_poses);
+      const RigidTransform world_T_lidar =
+          world_T_reference * extrinsic->second;
+      for (const auto& point : keyframe.points) {
+        const Eigen::Vector3d global =
+            world_T_lidar.rotation * Eigen::Vector3d(point.x, point.y, point.z) +
+            world_T_lidar.translation;
+        const auto voxel = std::make_tuple(
+            static_cast<long long>(std::floor(global.x() / voxel_size_)),
+            static_cast<long long>(std::floor(global.y() / voxel_size_)),
+            static_cast<long long>(std::floor(global.z() / voxel_size_)));
+        if (!occupied_voxels.insert(voxel).second) continue;
+        const auto color = colors_.at(lidar_name);
+        result.push_back({static_cast<float>(global.x()),
+                          static_cast<float>(global.y()),
+                          static_cast<float>(global.z()), color.r, color.g,
+                          color.b, lidar_indices_.at(lidar_name)});
+      }
+    }
+  }
+  return result;
+}
+
 }  // namespace offline
 }  // namespace mloam

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
@@ -29,6 +30,7 @@ struct Options {
   std::vector<std::string> include;
   std::vector<std::string> exclude;
   std::string reference;
+  std::string backend_mode;
   std::string output_root;
   std::size_t begin = std::numeric_limits<std::size_t>::max();
   std::size_t end = std::numeric_limits<std::size_t>::max();
@@ -60,6 +62,7 @@ void usage(std::ostream& stream) {
          << "  --translation-perturbation M       optional sweep translation magnitude (default 0)\n"
          << "  --include a,b --exclude c select LiDAR names\n"
          << "  --reference NAME          override reference LiDAR\n"
+         << "  --backend-mode MODE       disabled|precise_refine|coarse_bootstrap|coarse_periodic\n"
          << "  --begin N --end N --stride N\n"
          << "  --seed N --output-root DIR --ros-publish\n";
 }
@@ -91,6 +94,7 @@ Options parseOptions(int argc, char** argv) {
     else if (argument == "--include") options.include = split(value);
     else if (argument == "--exclude") options.exclude = split(value);
     else if (argument == "--reference") options.reference = value;
+    else if (argument == "--backend-mode") options.backend_mode = value;
     else if (argument == "--output-root") options.output_root = value;
     else if (argument == "--begin") options.begin = std::stoull(value);
     else if (argument == "--end") options.end = std::stoull(value);
@@ -107,6 +111,17 @@ std::vector<std::size_t> coarseLevels(const std::string& value) {
   const std::size_t level = std::stoull(value);
   if (level > 2) throw std::invalid_argument("coarse level must be 0, 1, 2, or all");
   return {level};
+}
+
+offline::JointBackendMode backendMode(const std::string& value) {
+  if (value == "disabled") return offline::JointBackendMode::kDisabled;
+  if (value == "precise_refine")
+    return offline::JointBackendMode::kPreciseRefine;
+  if (value == "coarse_bootstrap")
+    return offline::JointBackendMode::kCoarseBootstrap;
+  if (value == "coarse_periodic")
+    return offline::JointBackendMode::kCoarsePeriodic;
+  throw std::invalid_argument("unknown backend mode: " + value);
 }
 
 std::vector<offline::ScenarioConfiguration> scenarios(
@@ -152,9 +167,18 @@ std::vector<const offline::LidarConfig*> enabledLidars(
 
 void configureEstimator(const offline::OfflineManifest& manifest,
                         const offline::ScenarioConfiguration& scenario,
-                        const std::string& config_file) {
+                        const std::string& config_file,
+                        bool reference_only = false) {
   readParameters(config_file);
-  const auto lidars = enabledLidars(manifest);
+  auto lidars = enabledLidars(manifest);
+  if (reference_only) {
+    lidars.erase(
+        std::remove_if(lidars.begin(), lidars.end(),
+                       [&](const offline::LidarConfig* lidar) {
+                         return lidar->name != manifest.reference_lidar;
+                       }),
+        lidars.end());
+  }
   for (const auto* lidar : lidars) {
     if (std::abs(lidar->scan_period - SCAN_PERIOD) > 1e-6)
       throw std::invalid_argument(
@@ -167,7 +191,7 @@ void configureEstimator(const offline::OfflineManifest& manifest,
   TBL.resize(NUM_OF_LASER);
   TDBL.resize(NUM_OF_LASER);
   CLOUD_TOPIC.resize(NUM_OF_LASER);
-  COV_EXT.resize(NUM_OF_LASER, Eigen::Matrix<double, 6, 6>::Zero());
+  COV_EXT.assign(NUM_OF_LASER, Eigen::Matrix<double, 6, 6>::Zero());
   for (std::size_t i = 0; i < lidars.size(); ++i) {
     if (lidars[i]->name == manifest.reference_lidar) IDX_REF = i;
     const auto& transform = scenario.initial_extrinsics.at(lidars[i]->name);
@@ -187,12 +211,31 @@ void configureEstimator(const offline::OfflineManifest& manifest,
 
 offline::EstimatorCallback estimatorCallback(
     Estimator& estimator, const offline::OfflineManifest& manifest,
-    bool publish_ros) {
-  const auto lidars = enabledLidars(manifest);
-  return [&estimator, lidars, publish_ros](const offline::EstimatorInput& input) {
+    bool publish_ros, bool reference_only = false) {
+  const auto all_lidars = enabledLidars(manifest);
+  auto estimator_lidars = all_lidars;
+  if (reference_only) {
+    estimator_lidars.erase(
+        std::remove_if(estimator_lidars.begin(), estimator_lidars.end(),
+                       [&](const offline::LidarConfig* lidar) {
+                         return lidar->name != manifest.reference_lidar;
+                       }),
+        estimator_lidars.end());
+  }
+  return [&estimator, all_lidars, estimator_lidars, publish_ros,
+          reference_only](const offline::EstimatorInput& input) {
+    std::vector<offline::PreparedLidarFrame> prepared_for_estimator;
+    const std::vector<offline::PreparedLidarFrame>* prepared = &input.lidars;
+    if (reference_only) {
+      for (const auto& frame : input.lidars) {
+        if (frame.lidar_name == estimator_lidars.front()->name)
+          prepared_for_estimator.push_back(frame);
+      }
+      prepared = &prepared_for_estimator;
+    }
     const auto odometry_begin = std::chrono::steady_clock::now();
     const auto estimate = estimator.processPreparedFrame(
-        input.timestamp, input.lidars, publish_ros);
+        input.timestamp, *prepared, publish_ros);
     const double odometry_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - odometry_begin).count();
     LidarMapperFrameInput mapping_input;
@@ -203,8 +246,8 @@ offline::EstimatorCallback estimatorCallback(
     mapping_input.surface_cloud = estimate.surface_cloud;
     mapping_input.odometry = Pose(estimate.world_R_reference,
                                   estimate.world_t_reference);
-    mapping_input.extrinsics.reserve(lidars.size());
-    for (std::size_t i = 0; i < lidars.size(); ++i) {
+    mapping_input.extrinsics.reserve(estimator_lidars.size());
+    for (std::size_t i = 0; i < estimator_lidars.size(); ++i) {
       Pose extrinsic(estimate.reference_R_lidar[i],
                      estimate.reference_t_lidar[i]);
       extrinsic.cov_ = estimator.covbl_[i];
@@ -223,21 +266,39 @@ offline::EstimatorCallback estimatorCallback(
     const auto collect_features = [&](const common::PointICloud& cloud) {
       for (const auto& point : cloud) {
         const int sensor = static_cast<int>(std::lround(point.intensity));
-        if (sensor < 0 || sensor >= static_cast<int>(lidars.size())) continue;
-        output.feature_points_reference[lidars[sensor]->name].push_back(
+        if (sensor < 0 ||
+            sensor >= static_cast<int>(estimator_lidars.size()))
+          continue;
+        output.feature_points_reference[estimator_lidars[sensor]->name]
+            .push_back(
             {point.x, point.y, point.z, point.intensity});
       }
     };
     collect_features(estimate.corner_cloud);
     collect_features(estimate.surface_cloud);
-    for (std::size_t i = 0; i < lidars.size(); ++i) {
+    for (const auto* lidar : all_lidars) {
+      const auto estimated = std::find_if(
+          estimator_lidars.begin(), estimator_lidars.end(),
+          [&](const offline::LidarConfig* candidate) {
+            return candidate->name == lidar->name;
+          });
+      if (estimated == estimator_lidars.end()) {
+        output.reference_T_lidar[lidar->name] =
+            input.scenario->initial_extrinsics.at(lidar->name);
+        output.observable[lidar->name] = false;
+        output.corner_features[lidar->name] = 0;
+        output.surface_features[lidar->name] = 0;
+        continue;
+      }
+      const std::size_t i =
+          static_cast<std::size_t>(estimated - estimator_lidars.begin());
       offline::RigidTransform transform;
       transform.rotation = estimate.reference_R_lidar[i];
       transform.translation = estimate.reference_t_lidar[i];
-      output.reference_T_lidar[lidars[i]->name] = transform;
-      output.observable[lidars[i]->name] = estimate.observable[i];
-      output.corner_features[lidars[i]->name] = estimate.corner_features[i];
-      output.surface_features[lidars[i]->name] = estimate.surface_features[i];
+      output.reference_T_lidar[lidar->name] = transform;
+      output.observable[lidar->name] = estimate.observable[i];
+      output.corner_features[lidar->name] = estimate.corner_features[i];
+      output.surface_features[lidar->name] = estimate.surface_features[i];
     }
     return output;
   };
@@ -246,6 +307,20 @@ offline::EstimatorCallback estimatorCallback(
 std::string join(const std::string& root, const std::string& child) {
   return !root.empty() && root.back() == '/' ? root + child
                                              : root + '/' + child;
+}
+
+offline::RunResult runPass(
+    const offline::OfflineManifest& manifest,
+    const offline::ScenarioConfiguration& scenario,
+    const std::string& algorithm_config, const std::string& output_directory,
+    bool publish_ros, bool reference_only) {
+  configureEstimator(manifest, scenario, algorithm_config, reference_only);
+  Estimator estimator;
+  estimator.setParameter();
+  initializeLidarMapperCore();
+  return offline::runOffline(
+      manifest, scenario, output_directory,
+      estimatorCallback(estimator, manifest, publish_ros, reference_only));
 }
 
 }  // namespace
@@ -258,6 +333,12 @@ int main(int argc, char** argv) {
     const Options options = parseOptions(argc, argv);
     auto manifest = offline::loadManifest(options.manifest);
     if (!options.reference.empty()) manifest.reference_lidar = options.reference;
+    if (!options.backend_mode.empty()) {
+      manifest.joint_backend.mode = backendMode(options.backend_mode);
+      manifest.joint_backend.enabled =
+          manifest.joint_backend.mode !=
+          offline::JointBackendMode::kDisabled;
+    }
     if (options.begin != std::numeric_limits<std::size_t>::max())
       manifest.frame_begin = options.begin;
     if (options.end != std::numeric_limits<std::size_t>::max())
@@ -272,16 +353,91 @@ int main(int argc, char** argv) {
       throw std::invalid_argument(
           "mloam_config in the manifest or --mloam-config is required");
 
+    const auto configured_scenarios = scenarios(manifest, options);
+    if (manifest.joint_backend.enabled) {
+      for (const auto& scenario : configured_scenarios) {
+        if (scenario.scenario == offline::CalibrationScenario::kPriorFree)
+          throw std::invalid_argument(
+              "the joint backend requires an extrinsic prior; "
+              "prior_free is intentionally unsupported");
+      }
+    }
+
     int exit_code = 0;
-    for (const auto& scenario : scenarios(manifest, options)) {
-      configureEstimator(manifest, scenario, algorithm_config);
-      Estimator estimator;
-      estimator.setParameter();
-      initializeLidarMapperCore();
-      const auto result = offline::runOffline(
-          manifest, scenario, join(manifest.output_root, scenario.name),
-          estimatorCallback(estimator, manifest, options.publish_ros));
+    for (const auto& scenario : configured_scenarios) {
+      offline::RunResult result;
+      const bool coarse_bootstrap =
+          manifest.joint_backend.enabled &&
+          manifest.joint_backend.mode ==
+              offline::JointBackendMode::kCoarseBootstrap;
+      const bool coarse_retroactive =
+          manifest.joint_backend.enabled &&
+          manifest.joint_backend.mode ==
+              offline::JointBackendMode::kCoarsePeriodic;
+      if (coarse_bootstrap || coarse_retroactive) {
+        auto initialization_manifest = manifest;
+        if (coarse_bootstrap) {
+          const std::size_t remaining =
+              std::numeric_limits<std::size_t>::max() -
+              initialization_manifest.frame_begin;
+          const std::size_t bootstrap_end =
+              initialization_manifest.joint_backend.bootstrap_frames >
+                      remaining
+                  ? std::numeric_limits<std::size_t>::max()
+                  : initialization_manifest.frame_begin +
+                        initialization_manifest.joint_backend.bootstrap_frames;
+          initialization_manifest.frame_end =
+              std::min(initialization_manifest.frame_end, bootstrap_end);
+        }
+        auto initialization_scenario = scenario;
+        if (coarse_bootstrap) initialization_scenario.estimator_mode = 0;
+        const std::string scenario_directory =
+            join(manifest.output_root, scenario.name);
+        const std::string initialization_name =
+            coarse_bootstrap ? "bootstrap" : "coarse_pass";
+        const auto initialization = runPass(
+            initialization_manifest, initialization_scenario,
+            algorithm_config,
+            join(scenario_directory, initialization_name),
+            options.publish_ros, coarse_bootstrap);
+        std::cout << scenario.name << '/' << initialization_name << ": "
+                  << offline::runStatusName(initialization.status)
+                  << ", backend="
+                  << offline::jointBackendStateName(
+                         initialization.backend.state)
+                  << ", processed=" << initialization.processed_frames
+                  << ", dropped=" << initialization.dropped_frames
+                  << std::endl;
+        if (!initialization.backend.accepted) {
+          result = initialization;
+        } else {
+          auto replay_manifest = manifest;
+          if (replay_manifest.joint_backend.maximum_backend_passes > 1) {
+            replay_manifest.joint_backend.mode =
+                offline::JointBackendMode::kPreciseRefine;
+          } else {
+            replay_manifest.joint_backend.enabled = false;
+            replay_manifest.joint_backend.mode =
+                offline::JointBackendMode::kDisabled;
+          }
+          auto replay_scenario = scenario;
+          replay_scenario.initial_extrinsics =
+              initialization.final_extrinsics;
+          replay_scenario.estimator_mode = 0;
+          replay_scenario.scenario =
+              offline::CalibrationScenario::kPrecise;
+          result = runPass(replay_manifest, replay_scenario, algorithm_config,
+                           scenario_directory, options.publish_ros, false);
+        }
+      } else {
+        result = runPass(
+            manifest, scenario, algorithm_config,
+            join(manifest.output_root, scenario.name), options.publish_ros,
+            false);
+      }
       std::cout << scenario.name << ": " << offline::runStatusName(result.status)
+                << ", backend="
+                << offline::jointBackendStateName(result.backend.state)
                 << ", processed=" << result.processed_frames
                 << ", dropped=" << result.dropped_frames << std::endl;
       if (result.status == offline::RunStatus::kFailed) exit_code = 1;

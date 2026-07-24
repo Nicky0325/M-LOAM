@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "mloam/offline/artifacts.hpp"
+#include "mloam/offline/joint_backend.hpp"
 
 namespace offline = mloam::offline;
 
@@ -77,12 +78,29 @@ TEST(Artifacts, WritesStableSchemasMapsAndPerSensorKeyframes) {
   artifacts.addOnlineFeatures(
       offline::RigidTransform(),
       {{"top", {{1.0f, 2.0f, 3.0f, 0.0f}}}}, config.lidars);
+  offline::JointBackendResult backend;
+  backend.state = offline::JointBackendState::kAccepted;
+  backend.eligible = true;
+  backend.converged = true;
+  backend.accepted = true;
+  backend.reason = "fixture accepted";
+  backend.optimized_extrinsics =
+      offline::referenceRelativeExtrinsics(config);
+  offline::RigidTransform corrected_pose;
+  corrected_pose.translation.x() = 0.25;
+  backend.optimized_keyframe_poses[3] = corrected_pose;
+  backend.lidar_diagnostics["top"].connected = true;
+  backend.lidar_diagnostics["top"].observable = true;
+  backend.lidar_diagnostics["side"].connected = true;
+  backend.lidar_diagnostics["side"].observable = true;
+  backend.iterations.push_back(
+      {"joint", 0, 4, 20, 0.2, 0.1, true});
 
   const std::string output = "/tmp/mloam_artifacts_" +
                              std::to_string(static_cast<long long>(getpid()));
   artifacts.write(output, config, scenario, mapper,
                   offline::referenceRelativeExtrinsics(config),
-                  offline::RunStatus::kNonConverged);
+                  offline::RunStatus::kNonConverged, &backend);
 
   EXPECT_TRUE(exists(output + "/resolved_config.yaml"));
   EXPECT_TRUE(exists(output + "/summary.yaml"));
@@ -90,6 +108,10 @@ TEST(Artifacts, WritesStableSchemasMapsAndPerSensorKeyframes) {
   EXPECT_TRUE(exists(output + "/runtime.csv"));
   EXPECT_TRUE(exists(output + "/features.csv"));
   EXPECT_TRUE(exists(output + "/trajectory.csv"));
+  EXPECT_TRUE(exists(output + "/trajectory_corrected.csv"));
+  EXPECT_TRUE(exists(output + "/backend_windows.csv"));
+  EXPECT_TRUE(exists(output + "/backend_extrinsics_history.csv"));
+  EXPECT_TRUE(exists(output + "/backend_diagnostics.yaml"));
   EXPECT_TRUE(exists(output + "/extrinsics_history.csv"));
   EXPECT_TRUE(exists(output + "/observability_history.csv"));
   EXPECT_TRUE(exists(output + "/optimized_extrinsics.yaml"));
@@ -99,6 +121,7 @@ TEST(Artifacts, WritesStableSchemasMapsAndPerSensorKeyframes) {
   EXPECT_TRUE(exists(output + "/map_side.pcd"));
   EXPECT_TRUE(exists(output + "/map_merged_rgb.pcd"));
   EXPECT_TRUE(exists(output + "/map_final_rgb.pcd"));
+  EXPECT_TRUE(exists(output + "/map_backend_corrected_rgb.pcd"));
   EXPECT_TRUE(exists(output + "/keyframes/top/000003.pcd"));
   EXPECT_TRUE(exists(output + "/keyframes/side/000003.pcd"));
   EXPECT_NE(std::string::npos,
@@ -110,6 +133,12 @@ TEST(Artifacts, WritesStableSchemasMapsAndPerSensorKeyframes) {
   EXPECT_NE(std::string::npos,
             readFile(output + "/resolved_config.yaml")
                 .find("injected_perturbations:"));
+  EXPECT_NE(std::string::npos,
+            readFile(output + "/resolved_config.yaml")
+                .find("maximum_backend_passes:"));
+  EXPECT_NE(std::string::npos,
+            readFile(output + "/backend_diagnostics.yaml")
+                .find("state: accepted"));
   EXPECT_NE(std::string::npos,
             readFile(output + "/summary.yaml").find("convergence_frame:"));
   EXPECT_NE(std::string::npos,

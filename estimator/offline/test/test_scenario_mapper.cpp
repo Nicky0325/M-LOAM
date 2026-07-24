@@ -156,3 +156,25 @@ TEST(LidarMapper, PreservesProvenanceAndRebuildsWithFinalExtrinsics) {
   EXPECT_EQ(0, map[0].lidar_index);
   EXPECT_EQ(1, map[1].lidar_index);
 }
+
+TEST(LidarMapper, PropagatesSparsePoseCorrectionsAcrossHistory) {
+  const auto config = manifest();
+  offline::LidarMapper mapper(config.lidars, 0.01);
+  for (std::size_t index = 0; index < 3; ++index) {
+    offline::MappingFrame frame;
+    frame.frame_index = index * 10;
+    frame.timestamp = static_cast<double>(index);
+    frame.world_T_reference.translation.x() = static_cast<double>(index);
+    frame.lidars = {onePoint("top", 0.0f), onePoint("side", 0.0f)};
+    frame.reference_T_lidar = offline::referenceRelativeExtrinsics(config);
+    mapper.processFrame(std::move(frame));
+  }
+  std::map<std::size_t, offline::RigidTransform> optimized;
+  optimized[0].translation.y() = 0.0;
+  optimized[20].translation = Eigen::Vector3d(2.0, 2.0, 0.0);
+  offline::RigidTransform original;
+  original.translation.x() = 1.0;
+  const auto corrected =
+      mapper.correctedReferencePose(10, original, optimized);
+  EXPECT_TRUE(corrected.translation.isApprox(Eigen::Vector3d(1.0, 1.0, 0.0)));
+}

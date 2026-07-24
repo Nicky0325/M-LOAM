@@ -21,6 +21,7 @@ struct OfflineManifest {
   std::size_t frame_end = std::numeric_limits<std::size_t>::max();
   std::size_t frame_stride = 1;
   double minimum_finite_ratio = 0.95;
+  JointBackendConfig joint_backend;
   std::vector<LidarConfig> lidars;
 };
 

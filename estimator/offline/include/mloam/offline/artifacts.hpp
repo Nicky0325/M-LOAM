@@ -11,6 +11,8 @@
 namespace mloam {
 namespace offline {
 
+struct JointBackendResult;
+
 enum class RunStatus { kSuccess, kNonConverged, kFailed };
 
 struct SynchronizationRecord {
@@ -70,7 +72,8 @@ class RunArtifacts {
              const ScenarioConfiguration& scenario,
              const LidarMapper& mapper,
              const std::map<std::string, RigidTransform>& final_extrinsics,
-             RunStatus status) const;
+             RunStatus status,
+             const JointBackendResult* backend = nullptr) const;
 
  private:
   std::vector<SynchronizationRecord> synchronization_;

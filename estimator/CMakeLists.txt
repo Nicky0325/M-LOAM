@@ -57,6 +57,7 @@ catkin_package(
 ######################################################## float libraries
 add_library(mloam_offline
     offline/src/artifacts.cpp
+    offline/src/joint_backend.cpp
     offline/src/lidar_mapper.cpp
     offline/src/manifest.cpp
     offline/src/pcd_preprocessor.cpp
@@ -65,7 +66,7 @@ add_library(mloam_offline
     offline/src/sequence_reader.cpp
 )
 target_include_directories(mloam_offline PUBLIC offline/include ${PCL_INCLUDE_DIRS})
-target_link_libraries(mloam_offline ${PCL_LIBRARIES} yaml-cpp)
+target_link_libraries(mloam_offline ${PCL_LIBRARIES} ${CERES_LIBRARIES} yaml-cpp)
 
 add_library(mloam_lib
     src/initial/initial_extrinsics.cpp

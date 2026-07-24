@@ -113,6 +113,45 @@ struct MappingFrame {
   std::map<std::string, RigidTransform> reference_T_lidar;
 };
 
+enum class JointBackendMode {
+  kDisabled,
+  kPreciseRefine,
+  kCoarseBootstrap,
+  kCoarsePeriodic
+};
+
+struct JointBackendConfig {
+  bool enabled = false;
+  JointBackendMode mode = JointBackendMode::kDisabled;
+  double initial_voxel_size = 4.0;
+  double minimum_voxel_size = 0.5;
+  double downsample_size = 0.25;
+  double planarity_ratio = 20.0;
+  std::size_t minimum_points_per_voxel = 20;
+  std::size_t maximum_points_per_observation = 4;
+  std::size_t maximum_points_per_cloud = 12000;
+  std::size_t minimum_keyframes = 20;
+  std::size_t maximum_keyframes = 80;
+  std::size_t bootstrap_frames = 250;
+  std::size_t minimum_mixed_voxels_per_lidar = 50;
+  double heldout_fraction = 0.2;
+  double minimum_heldout_improvement = 0.05;
+  std::size_t pose_outer_iterations = 2;
+  std::size_t extrinsic_outer_iterations = 4;
+  std::size_t joint_outer_iterations = 8;
+  std::size_t solver_iterations = 30;
+  double maximum_condition_number = 1e10;
+  double minimum_relative_eigenvalue = 1e-8;
+  double precise_max_rotation_update_deg = 1.0;
+  double precise_max_translation_update_m = 0.10;
+  double coarse_max_rotation_update_deg = 12.0;
+  double coarse_max_translation_update_m = 0.75;
+  double maximum_pose_rotation_update_deg = 10.0;
+  double maximum_pose_translation_update_m = 2.0;
+  std::size_t maximum_backend_passes = 2;
+  std::uint64_t partition_seed = 42;
+};
+
 enum class CalibrationScenario {
   kPrecise,
   kCalibratedInit,

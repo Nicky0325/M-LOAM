@@ -6,6 +6,62 @@ through ROS topics. ROS is still initialized because the existing estimator
 uses ROS time, and `--ros-publish` can enable the existing visualization
 publishers.
 
+## Joint MLCC-style backend prototype
+
+The runner includes an opt-in, batch joint pose/extrinsic backend based on the
+adaptive planar-voxel objective described in MLCC. It keeps the native
+per-LiDAR keyframe clouds, refines reference-LiDAR poses and all constant
+relative extrinsics, validates updates on held-out voxels, and rebuilds the
+entire historical map from native points after an accepted update.
+
+Run mapping with trusted/precise extrinsics and allow a bounded consistency
+refinement:
+
+```bash
+rosrun mloam mloam_offline_runner \
+  --manifest estimator/config/offline/aiv5_sequence.yaml \
+  --scenario precise \
+  --backend-mode precise_refine
+```
+
+Run the coarse workflow. The first 600 synchronized frames use only
+`lidar_fll_at128` for frontend motion while retaining all six native clouds.
+If the backend accepts the calibration, the runner automatically restarts the
+full sequence with all six LiDARs and fixed accepted extrinsics:
+
+```bash
+rosrun mloam mloam_offline_runner \
+  --manifest estimator/config/offline/aiv5_sequence.yaml \
+  --scenario calibration_sweep \
+  --rotation-perturbations 3,5 \
+  --translation-perturbation 0.3 \
+  --backend-mode coarse_bootstrap
+```
+
+The backend never applies an update unless the mixed planar-voxel graph is
+connected, every auxiliary LiDAR has sufficient overlap, the held-out
+objective improves, the extrinsic Hessian is observable, and pose/extrinsic
+changes remain inside the configured bounds. Missing priors are intentionally
+unsupported.
+
+Additional artifacts are:
+
+- `trajectory_corrected.csv`
+- `backend_extrinsics_history.csv`
+- `backend_windows.csv`
+- `backend_diagnostics.yaml`
+- `map_backend_corrected_rgb.pcd`
+
+In `coarse_bootstrap`, initialization artifacts are stored in the
+`bootstrap/` subdirectory and the replayed full-sensor result is stored in the
+scenario directory. This prototype pauses for batch optimization and replay;
+it does not mutate M-LOAM's live marginalized window.
+
+`coarse_periodic` is the experimental retroactive alternative: it first lets
+all LiDARs run with the coarse prior, optimizes the retained history, and then
+replays the sequence with the accepted fixed extrinsics. It is an offline
+feedback cycle, not a real-time optimizer.
+
 This guide covers dataset preparation, manifest configuration, benchmark runs,
 and the generated results. The six-LiDAR template is
 [`../config/offline/example_six_lidar.yaml`](../config/offline/example_six_lidar.yaml).

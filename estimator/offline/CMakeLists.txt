@@ -8,14 +8,19 @@ find_package(GTest REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io)
+find_package(Ceres REQUIRED)
 
 enable_testing()
-add_library(mloam_offline src/artifacts.cpp src/lidar_mapper.cpp src/manifest.cpp
-                          src/pcd_preprocessor.cpp src/runner.cpp src/scenario.cpp
-                          src/sequence_reader.cpp)
-target_include_directories(mloam_offline PUBLIC include ${PCL_INCLUDE_DIRS})
+add_library(mloam_offline src/artifacts.cpp src/joint_backend.cpp
+                          src/lidar_mapper.cpp src/manifest.cpp
+                          src/pcd_preprocessor.cpp src/runner.cpp
+                          src/scenario.cpp src/sequence_reader.cpp)
+target_include_directories(mloam_offline PUBLIC include ${PCL_INCLUDE_DIRS}
+                                                ${CERES_INCLUDE_DIRS})
 target_compile_definitions(mloam_offline PUBLIC ${PCL_DEFINITIONS})
-target_link_libraries(mloam_offline PUBLIC Eigen3::Eigen yaml-cpp ${PCL_LIBRARIES})
+target_link_libraries(mloam_offline PUBLIC Eigen3::Eigen yaml-cpp
+                                           ${PCL_LIBRARIES}
+                                           ${CERES_LIBRARIES})
 
 add_executable(test_sequence_reader test/test_sequence_reader.cpp)
 target_include_directories(test_sequence_reader PRIVATE include)
@@ -46,3 +51,8 @@ add_executable(test_offline_integration test/test_offline_integration.cpp)
 target_include_directories(test_offline_integration PRIVATE include)
 target_link_libraries(test_offline_integration PRIVATE mloam_offline GTest::GTest GTest::Main)
 add_test(NAME offline_integration COMMAND test_offline_integration)
+
+add_executable(test_joint_backend test/test_joint_backend.cpp)
+target_include_directories(test_joint_backend PRIVATE include)
+target_link_libraries(test_joint_backend PRIVATE mloam_offline GTest::GTest GTest::Main)
+add_test(NAME joint_backend COMMAND test_joint_backend)

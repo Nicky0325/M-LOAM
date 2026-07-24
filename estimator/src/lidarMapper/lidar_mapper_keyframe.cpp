@@ -1276,6 +1276,21 @@ void initializeLidarMapperCore(bool with_uncertainty,
     pose_keyframes_6d.clear();
     pose_keyframes_3d->clear();
     laser_keyframes_6d.poses.clear();
+    laser_after_mapped_path.poses.clear();
+    surrounding_keyframes->clear();
+    surrounding_keyframes_ds->clear();
+    global_map_keyframes->clear();
+    global_map_keyframes_ds->clear();
+    laser_cloud_surf_last->clear();
+    laser_cloud_corner_last->clear();
+    laser_cloud_surf_last_ds->clear();
+    laser_cloud_corner_last_ds->clear();
+    laser_cloud_full_res->clear();
+    laser_cloud_outlier->clear();
+    laser_cloud_outlier_ds->clear();
+    laser_cloud_surf_cov->clear();
+    laser_cloud_corner_cov->clear();
+    laser_cloud_outlier_cov->clear();
     surf_cloud_keyframes_cov.clear();
     corner_cloud_keyframes_cov.clear();
     outlier_cloud_keyframes_cov.clear();
@@ -1294,6 +1309,7 @@ void initializeLidarMapperCore(bool with_uncertainty,
     laser_cloud_corner_from_map_cov->clear();
     laser_cloud_surf_from_map_cov_ds->clear();
     laser_cloud_corner_from_map_cov_ds->clear();
+    save_new_keyframe = false;
 }
 
 LidarMapperFrameResult processLidarMapperFrame(const LidarMapperFrameInput &input)

@@ -8,6 +8,40 @@ frame_end: 760
 frame_stride: 1
 minimum_finite_ratio: 0.10
 
+# Enable with --backend-mode precise_refine or --backend-mode coarse_bootstrap.
+# The backend is deliberately opt-in so existing M-LOAM benchmark commands keep
+# their original behavior.
+joint_backend:
+  enabled: false
+  mode: disabled
+  initial_voxel_size: 4.0
+  minimum_voxel_size: 0.5
+  downsample_size: 0.35
+  planarity_ratio: 10.0
+  minimum_points_per_voxel: 20
+  maximum_points_per_observation: 4
+  maximum_points_per_cloud: 8000
+  minimum_keyframes: 20
+  maximum_keyframes: 60
+  bootstrap_frames: 600
+  minimum_mixed_voxels_per_lidar: 50
+  heldout_fraction: 0.2
+  minimum_heldout_improvement: 0.05
+  pose_outer_iterations: 2
+  extrinsic_outer_iterations: 4
+  joint_outer_iterations: 8
+  solver_iterations: 30
+  maximum_condition_number: 1.0e10
+  minimum_relative_eigenvalue: 1.0e-8
+  precise_max_rotation_update_deg: 1.0
+  precise_max_translation_update_m: 0.10
+  coarse_max_rotation_update_deg: 12.0
+  coarse_max_translation_update_m: 0.75
+  maximum_pose_rotation_update_deg: 10.0
+  maximum_pose_translation_update_m: 2.0
+  maximum_backend_passes: 2
+  partition_seed: 42
+
 lidars:
   - name: lidar_fll_at128
     enabled: true

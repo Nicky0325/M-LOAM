@@ -39,6 +39,14 @@ class LidarMapper {
   std::vector<RgbPoint> buildOnlineRgbMap() const;
   std::vector<RgbPoint> rebuildFinalRgbMap(
       const std::map<std::string, RigidTransform>& final_extrinsics) const;
+  RigidTransform correctedReferencePose(
+      std::size_t frame_index, const RigidTransform& original_pose,
+      const std::map<std::size_t, RigidTransform>& optimized_keyframe_poses)
+      const;
+  std::vector<RgbPoint> rebuildCorrectedRgbMap(
+      const std::map<std::string, RigidTransform>& final_extrinsics,
+      const std::map<std::size_t, RigidTransform>& optimized_keyframe_poses)
+      const;
 
  private:
   std::vector<std::string> lidar_order_;

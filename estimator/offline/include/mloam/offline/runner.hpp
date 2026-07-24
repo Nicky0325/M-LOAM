@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "mloam/offline/artifacts.hpp"
+#include "mloam/offline/joint_backend.hpp"
 #include "mloam/offline/pcd_preprocessor.hpp"
 #include "mloam/offline/sequence_reader.hpp"
 
@@ -40,6 +41,8 @@ struct RunResult {
   RunStatus status = RunStatus::kFailed;
   std::size_t processed_frames = 0;
   std::size_t dropped_frames = 0;
+  std::map<std::string, RigidTransform> final_extrinsics;
+  JointBackendResult backend;
 };
 
 RunResult runOffline(const OfflineManifest& manifest,

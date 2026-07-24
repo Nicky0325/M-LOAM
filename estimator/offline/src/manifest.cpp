@@ -111,6 +111,59 @@ const LidarConfig& findLidar(const OfflineManifest& manifest,
   throw std::invalid_argument("unknown LiDAR: " + name);
 }
 
+JointBackendMode parseBackendMode(const std::string& value) {
+  if (value == "disabled") return JointBackendMode::kDisabled;
+  if (value == "precise_refine") return JointBackendMode::kPreciseRefine;
+  if (value == "coarse_bootstrap") return JointBackendMode::kCoarseBootstrap;
+  if (value == "coarse_periodic") return JointBackendMode::kCoarsePeriodic;
+  throw std::invalid_argument(
+      "joint_backend.mode must be disabled, precise_refine, "
+      "coarse_bootstrap, or coarse_periodic");
+}
+
+void parseJointBackend(const YAML::Node& node, JointBackendConfig* config) {
+  if (!node) return;
+  if (!node.IsMap())
+    throw std::invalid_argument("joint_backend must be a map");
+  if (node["enabled"]) config->enabled = node["enabled"].as<bool>();
+  if (node["mode"])
+    config->mode = parseBackendMode(node["mode"].as<std::string>());
+#define READ_BACKEND_VALUE(name) \
+  if (node[#name]) config->name = node[#name].as<decltype(config->name)>()
+  READ_BACKEND_VALUE(initial_voxel_size);
+  READ_BACKEND_VALUE(minimum_voxel_size);
+  READ_BACKEND_VALUE(downsample_size);
+  READ_BACKEND_VALUE(planarity_ratio);
+  READ_BACKEND_VALUE(minimum_points_per_voxel);
+  READ_BACKEND_VALUE(maximum_points_per_observation);
+  READ_BACKEND_VALUE(maximum_points_per_cloud);
+  READ_BACKEND_VALUE(minimum_keyframes);
+  READ_BACKEND_VALUE(maximum_keyframes);
+  READ_BACKEND_VALUE(bootstrap_frames);
+  READ_BACKEND_VALUE(minimum_mixed_voxels_per_lidar);
+  READ_BACKEND_VALUE(heldout_fraction);
+  READ_BACKEND_VALUE(minimum_heldout_improvement);
+  READ_BACKEND_VALUE(pose_outer_iterations);
+  READ_BACKEND_VALUE(extrinsic_outer_iterations);
+  READ_BACKEND_VALUE(joint_outer_iterations);
+  READ_BACKEND_VALUE(solver_iterations);
+  READ_BACKEND_VALUE(maximum_condition_number);
+  READ_BACKEND_VALUE(minimum_relative_eigenvalue);
+  READ_BACKEND_VALUE(precise_max_rotation_update_deg);
+  READ_BACKEND_VALUE(precise_max_translation_update_m);
+  READ_BACKEND_VALUE(coarse_max_rotation_update_deg);
+  READ_BACKEND_VALUE(coarse_max_translation_update_m);
+  READ_BACKEND_VALUE(maximum_pose_rotation_update_deg);
+  READ_BACKEND_VALUE(maximum_pose_translation_update_m);
+  READ_BACKEND_VALUE(maximum_backend_passes);
+  READ_BACKEND_VALUE(partition_seed);
+#undef READ_BACKEND_VALUE
+  if (!config->enabled) config->mode = JointBackendMode::kDisabled;
+  if (config->enabled && config->mode == JointBackendMode::kDisabled)
+    throw std::invalid_argument(
+        "joint_backend.enabled requires a non-disabled mode");
+}
+
 }  // namespace
 
 OfflineManifest loadManifest(const std::string& path) {
@@ -132,6 +185,7 @@ OfflineManifest loadManifest(const std::string& path) {
     manifest.frame_stride = root["frame_stride"].as<std::size_t>();
   if (root["minimum_finite_ratio"])
     manifest.minimum_finite_ratio = root["minimum_finite_ratio"].as<double>();
+  parseJointBackend(root["joint_backend"], &manifest.joint_backend);
 
   const YAML::Node lidars = root["lidars"];
   if (!lidars || !lidars.IsSequence()) {
@@ -196,9 +250,64 @@ void validateManifest(const OfflineManifest& manifest) {
   if (manifest.minimum_finite_ratio < 0.0 ||
       manifest.minimum_finite_ratio > 1.0)
     throw std::invalid_argument("minimum finite ratio must be in [0, 1]");
+  const auto& backend = manifest.joint_backend;
+  if (backend.enabled) {
+    if (backend.mode == JointBackendMode::kDisabled)
+      throw std::invalid_argument(
+          "enabled joint backend requires a non-disabled mode");
+    if (!std::isfinite(backend.initial_voxel_size) ||
+        !std::isfinite(backend.minimum_voxel_size) ||
+        !std::isfinite(backend.downsample_size) ||
+        backend.initial_voxel_size <= 0.0 ||
+        backend.minimum_voxel_size <= 0.0 ||
+        backend.minimum_voxel_size > backend.initial_voxel_size ||
+        backend.downsample_size <= 0.0)
+      throw std::invalid_argument("invalid joint backend voxel sizes");
+    if (!std::isfinite(backend.planarity_ratio) ||
+        backend.planarity_ratio <= 1.0 ||
+        backend.minimum_points_per_voxel < 3 ||
+        backend.maximum_points_per_observation == 0 ||
+        backend.maximum_points_per_cloud == 0 ||
+        backend.minimum_keyframes < 2 ||
+        backend.maximum_keyframes < backend.minimum_keyframes ||
+        backend.bootstrap_frames < backend.minimum_keyframes ||
+        backend.minimum_mixed_voxels_per_lidar == 0)
+      throw std::invalid_argument("invalid joint backend sampling limits");
+    if (!std::isfinite(backend.heldout_fraction) ||
+        backend.heldout_fraction <= 0.0 || backend.heldout_fraction >= 0.5 ||
+        !std::isfinite(backend.minimum_heldout_improvement) ||
+        backend.minimum_heldout_improvement < 0.0 ||
+        backend.minimum_heldout_improvement >= 1.0)
+      throw std::invalid_argument("invalid joint backend validation split");
+    if (backend.pose_outer_iterations == 0 ||
+        backend.extrinsic_outer_iterations == 0 ||
+        backend.joint_outer_iterations == 0 ||
+        backend.solver_iterations == 0 ||
+        backend.maximum_backend_passes == 0 ||
+        !std::isfinite(backend.maximum_condition_number) ||
+        backend.maximum_condition_number <= 1.0 ||
+        !std::isfinite(backend.minimum_relative_eigenvalue) ||
+        backend.minimum_relative_eigenvalue <= 0.0)
+      throw std::invalid_argument("invalid joint backend solver settings");
+    if (!std::isfinite(backend.precise_max_rotation_update_deg) ||
+        !std::isfinite(backend.precise_max_translation_update_m) ||
+        !std::isfinite(backend.coarse_max_rotation_update_deg) ||
+        !std::isfinite(backend.coarse_max_translation_update_m) ||
+        !std::isfinite(backend.maximum_pose_rotation_update_deg) ||
+        !std::isfinite(backend.maximum_pose_translation_update_m) ||
+        backend.precise_max_rotation_update_deg <= 0.0 ||
+        backend.precise_max_translation_update_m <= 0.0 ||
+        backend.coarse_max_rotation_update_deg <= 0.0 ||
+        backend.coarse_max_translation_update_m <= 0.0 ||
+        backend.maximum_pose_rotation_update_deg <= 0.0 ||
+        backend.maximum_pose_translation_update_m <= 0.0)
+      throw std::invalid_argument(
+          "invalid joint backend update acceptance bounds");
+  }
 
   std::set<std::string> names;
   bool enabled_reference = false;
+  std::size_t enabled_lidars = 0;
   for (const auto& lidar : manifest.lidars) {
     if (lidar.name.empty() || !names.insert(lidar.name).second)
       throw std::invalid_argument("LiDAR names must be non-empty and unique");
@@ -220,9 +329,13 @@ void validateManifest(const OfflineManifest& manifest) {
       throw std::invalid_argument("invalid LiDAR segmentation parameters");
     if (lidar.name == manifest.reference_lidar && lidar.enabled)
       enabled_reference = true;
+    if (lidar.enabled) ++enabled_lidars;
   }
   if (!enabled_reference)
     throw std::invalid_argument("reference LiDAR must exist and be enabled");
+  if (backend.enabled && enabled_lidars < 2)
+    throw std::invalid_argument(
+        "joint backend requires at least two enabled LiDARs");
 }
 
 void applyLidarSelection(OfflineManifest& manifest,

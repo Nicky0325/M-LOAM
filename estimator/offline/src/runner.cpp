@@ -215,8 +215,46 @@ RunResult runOffline(const OfflineManifest& manifest,
       artifacts.addExtrinsic(item.second);
     }
   }
+  if (manifest.joint_backend.enabled && result.processed_frames != 0) {
+    JointCalibrationBackend backend;
+    result.backend = backend.optimize(
+        mapper, manifest.reference_lidar, final_extrinsics,
+        manifest.joint_backend);
+    if (result.backend.accepted) {
+      final_extrinsics = result.backend.optimized_extrinsics;
+      const std::size_t frame =
+          result.backend.optimized_keyframe_poses.empty()
+              ? 0
+              : result.backend.optimized_keyframe_poses.rbegin()->first;
+      for (const auto& lidar : manifest.lidars) {
+        if (!lidar.enabled || lidar.name == manifest.reference_lidar) continue;
+        const auto optimized = final_extrinsics.find(lidar.name);
+        if (optimized == final_extrinsics.end()) continue;
+        const auto truth = scenario.precise_extrinsics.at(lidar.name);
+        const auto diagnostics =
+            result.backend.lidar_diagnostics.find(lidar.name);
+        artifacts.addExtrinsic(
+            {frame, 0.0, lidar.name, optimized->second,
+             diagnostics != result.backend.lidar_diagnostics.end() &&
+                 diagnostics->second.observable,
+             rotationError(optimized->second, truth),
+             (optimized->second.translation - truth.translation).norm(),
+             CalibrationState::kConverged});
+      }
+      if (result.status != RunStatus::kFailed)
+        result.status = RunStatus::kSuccess;
+    }
+    const bool calibration_required =
+        manifest.joint_backend.mode == JointBackendMode::kCoarseBootstrap ||
+        manifest.joint_backend.mode == JointBackendMode::kCoarsePeriodic;
+    if (calibration_required && !result.backend.accepted &&
+        result.status != RunStatus::kFailed)
+      result.status = RunStatus::kNonConverged;
+  }
+  result.final_extrinsics = final_extrinsics;
   artifacts.write(output_directory, manifest, scenario, mapper,
-                  final_extrinsics, result.status);
+                  final_extrinsics, result.status,
+                  manifest.joint_backend.enabled ? &result.backend : nullptr);
   return result;
 }
 

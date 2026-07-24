@@ -1,4 +1,5 @@
 #include "mloam/offline/artifacts.hpp"
+#include "mloam/offline/joint_backend.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -202,7 +203,7 @@ void RunArtifacts::write(
     const std::string& output_directory, const OfflineManifest& manifest,
     const ScenarioConfiguration& scenario, const LidarMapper& mapper,
     const std::map<std::string, RigidTransform>& final_extrinsics,
-    RunStatus status) const {
+    RunStatus status, const JointBackendResult* backend) const {
   makeDirectories(output_directory);
   makeDirectories(output_directory + "/keyframes");
   for (const auto& lidar : manifest.lidars) {
@@ -227,6 +228,65 @@ void RunArtifacts::write(
            << scenario.rotation_perturbation_deg << '\n'
            << "translation_perturbation_m: "
            << scenario.translation_perturbation_m << '\n'
+           << "joint_backend:\n"
+           << "  enabled: "
+           << (manifest.joint_backend.enabled ? "true" : "false") << '\n'
+           << "  mode: "
+           << jointBackendModeName(manifest.joint_backend.mode) << '\n'
+           << "  initial_voxel_size: "
+           << manifest.joint_backend.initial_voxel_size << '\n'
+           << "  minimum_voxel_size: "
+           << manifest.joint_backend.minimum_voxel_size << '\n'
+           << "  downsample_size: "
+           << manifest.joint_backend.downsample_size << '\n'
+           << "  planarity_ratio: "
+           << manifest.joint_backend.planarity_ratio << '\n'
+           << "  minimum_points_per_voxel: "
+           << manifest.joint_backend.minimum_points_per_voxel << '\n'
+           << "  maximum_points_per_observation: "
+           << manifest.joint_backend.maximum_points_per_observation << '\n'
+           << "  maximum_points_per_cloud: "
+           << manifest.joint_backend.maximum_points_per_cloud << '\n'
+           << "  minimum_keyframes: "
+           << manifest.joint_backend.minimum_keyframes << '\n'
+           << "  maximum_keyframes: "
+           << manifest.joint_backend.maximum_keyframes << '\n'
+           << "  bootstrap_frames: "
+           << manifest.joint_backend.bootstrap_frames << '\n'
+           << "  minimum_mixed_voxels_per_lidar: "
+           << manifest.joint_backend.minimum_mixed_voxels_per_lidar << '\n'
+           << "  heldout_fraction: "
+           << manifest.joint_backend.heldout_fraction << '\n'
+           << "  minimum_heldout_improvement: "
+           << manifest.joint_backend.minimum_heldout_improvement << '\n'
+           << "  pose_outer_iterations: "
+           << manifest.joint_backend.pose_outer_iterations << '\n'
+           << "  extrinsic_outer_iterations: "
+           << manifest.joint_backend.extrinsic_outer_iterations << '\n'
+           << "  joint_outer_iterations: "
+           << manifest.joint_backend.joint_outer_iterations << '\n'
+           << "  solver_iterations: "
+           << manifest.joint_backend.solver_iterations << '\n'
+           << "  maximum_condition_number: "
+           << manifest.joint_backend.maximum_condition_number << '\n'
+           << "  minimum_relative_eigenvalue: "
+           << manifest.joint_backend.minimum_relative_eigenvalue << '\n'
+           << "  precise_max_rotation_update_deg: "
+           << manifest.joint_backend.precise_max_rotation_update_deg << '\n'
+           << "  precise_max_translation_update_m: "
+           << manifest.joint_backend.precise_max_translation_update_m << '\n'
+           << "  coarse_max_rotation_update_deg: "
+           << manifest.joint_backend.coarse_max_rotation_update_deg << '\n'
+           << "  coarse_max_translation_update_m: "
+           << manifest.joint_backend.coarse_max_translation_update_m << '\n'
+           << "  maximum_pose_rotation_update_deg: "
+           << manifest.joint_backend.maximum_pose_rotation_update_deg << '\n'
+           << "  maximum_pose_translation_update_m: "
+           << manifest.joint_backend.maximum_pose_translation_update_m << '\n'
+           << "  maximum_backend_passes: "
+           << manifest.joint_backend.maximum_backend_passes << '\n'
+           << "  partition_seed: "
+           << manifest.joint_backend.partition_seed << '\n'
            << "injected_perturbations:\n";
   for (const auto& item : scenario.injected_perturbations) {
     resolved << "  " << item.first << ": [";
@@ -321,6 +381,20 @@ void RunArtifacts::write(
     writeTransform(trajectory, record.world_T_reference);
     trajectory << '\n';
   }
+  auto corrected_trajectory =
+      output(output_directory + "/trajectory_corrected.csv");
+  corrected_trajectory << "frame,timestamp,tx,ty,tz,qx,qy,qz,qw\n";
+  for (const auto& record : trajectory_) {
+    const RigidTransform corrected =
+        backend != nullptr && backend->accepted
+            ? mapper.correctedReferencePose(
+                  record.frame, record.world_T_reference,
+                  backend->optimized_keyframe_poses)
+            : record.world_T_reference;
+    corrected_trajectory << record.frame << ',' << record.timestamp << ',';
+    writeTransform(corrected_trajectory, corrected);
+    corrected_trajectory << '\n';
+  }
   auto extrinsics = output(output_directory + "/extrinsics_history.csv");
   extrinsics << "frame,timestamp,lidar,tx,ty,tz,qx,qy,qz,qw,rotation_error_deg,translation_error_m,state\n";
   auto observability = output(output_directory + "/observability_history.csv");
@@ -338,13 +412,18 @@ void RunArtifacts::write(
                   << calibrationStateName(record.state) << '\n';
   }
 
-  const auto final_map = mapper.rebuildFinalRgbMap(final_extrinsics);
+  const auto final_map =
+      backend != nullptr && backend->accepted
+          ? mapper.rebuildCorrectedRgbMap(
+                final_extrinsics, backend->optimized_keyframe_poses)
+          : mapper.rebuildFinalRgbMap(final_extrinsics);
   const auto online_map = mapper.buildOnlineRgbMap();
   saveColored(output_directory + "/map_online_rgb.pcd", online_map);
   saveColored(output_directory + "/map_online_features_rgb.pcd",
               online_features_);
   saveColored(output_directory + "/map_merged_rgb.pcd", online_map);
   saveColored(output_directory + "/map_final_rgb.pcd", final_map);
+  saveColored(output_directory + "/map_backend_corrected_rgb.pcd", final_map);
   std::size_t lidar_index = 0;
   for (const auto& lidar : manifest.lidars) {
     if (!lidar.enabled) continue;
@@ -361,6 +440,97 @@ void RunArtifacts::write(
   }
 
   const auto metrics = alignmentMetrics(final_map);
+  if (backend != nullptr) {
+    auto backend_windows = output(output_directory + "/backend_windows.csv");
+    backend_windows
+        << "stage,outer_iteration,planar_voxels,residuals,"
+           "objective_before,objective_after,usable\n";
+    for (const auto& iteration : backend->iterations) {
+      backend_windows << iteration.stage << ',' << iteration.outer_iteration
+                      << ',' << iteration.planar_voxels << ','
+                      << iteration.residuals << ','
+                      << iteration.objective_before << ','
+                      << iteration.objective_after << ','
+                      << (iteration.usable ? "true" : "false") << '\n';
+    }
+    auto backend_history =
+        output(output_directory + "/backend_extrinsics_history.csv");
+    backend_history
+        << "lidar,tx,ty,tz,qx,qy,qz,qw,rotation_update_deg,"
+           "translation_update_m,mixed_planar_voxels,"
+           "minimum_hessian_eigenvalue,maximum_hessian_eigenvalue,"
+           "condition_number,connected,observable\n";
+    for (const auto& item : backend->optimized_extrinsics) {
+      const auto diagnostics = backend->lidar_diagnostics.find(item.first);
+      backend_history << item.first << ',';
+      writeTransform(backend_history, item.second);
+      if (diagnostics == backend->lidar_diagnostics.end()) {
+        backend_history << ",nan,nan,0,nan,nan,nan,false,false\n";
+      } else {
+        const auto& value = diagnostics->second;
+        backend_history << ',' << value.rotation_update_deg << ','
+                        << value.translation_update_m << ','
+                        << value.mixed_planar_voxels << ','
+                        << value.minimum_hessian_eigenvalue << ','
+                        << value.maximum_hessian_eigenvalue << ','
+                        << value.condition_number << ','
+                        << (value.connected ? "true" : "false") << ','
+                        << (value.observable ? "true" : "false") << '\n';
+      }
+    }
+    auto diagnostics = output(output_directory + "/backend_diagnostics.yaml");
+    diagnostics << "state: " << jointBackendStateName(backend->state) << '\n'
+                << "reason: " << csv(backend->reason) << '\n'
+                << "eligible: " << (backend->eligible ? "true" : "false")
+                << '\n'
+                << "converged: "
+                << (backend->converged ? "true" : "false") << '\n'
+                << "accepted: "
+                << (backend->accepted ? "true" : "false") << '\n'
+                << "selected_keyframes: " << backend->selected_keyframes
+                << '\n'
+                << "training_voxels: " << backend->training_voxels << '\n'
+                << "heldout_voxels: " << backend->heldout_voxels << '\n'
+                << "initial_training_objective: "
+                << backend->initial_training_objective << '\n'
+                << "final_training_objective: "
+                << backend->final_training_objective << '\n'
+                << "initial_heldout_objective: "
+                << backend->initial_heldout_objective << '\n'
+                << "final_heldout_objective: "
+                << backend->final_heldout_objective << '\n'
+                << "initial_reference_objective: "
+                << backend->initial_reference_objective << '\n'
+                << "final_reference_objective: "
+                << backend->final_reference_objective << '\n'
+                << "heldout_improvement: "
+                << backend->heldout_improvement << '\n'
+                << "maximum_pose_rotation_update_deg: "
+                << backend->maximum_pose_rotation_update_deg << '\n'
+                << "maximum_pose_translation_update_m: "
+                << backend->maximum_pose_translation_update_m << '\n'
+                << "lidars:\n";
+    for (const auto& item : backend->lidar_diagnostics) {
+      const auto& value = item.second;
+      diagnostics << "  " << item.first << ":\n"
+                  << "    mixed_planar_voxels: "
+                  << value.mixed_planar_voxels << '\n'
+                  << "    minimum_hessian_eigenvalue: "
+                  << value.minimum_hessian_eigenvalue << '\n'
+                  << "    maximum_hessian_eigenvalue: "
+                  << value.maximum_hessian_eigenvalue << '\n'
+                  << "    condition_number: " << value.condition_number
+                  << '\n'
+                  << "    rotation_update_deg: "
+                  << value.rotation_update_deg << '\n'
+                  << "    translation_update_m: "
+                  << value.translation_update_m << '\n'
+                  << "    connected: "
+                  << (value.connected ? "true" : "false") << '\n'
+                  << "    observable: "
+                  << (value.observable ? "true" : "false") << '\n';
+    }
+  }
   auto summary = output(output_directory + "/summary.yaml");
   summary << "status: " << runStatusName(status) << '\n'
           << "scenario: " << scenario.name << '\n'
@@ -368,6 +538,13 @@ void RunArtifacts::write(
           << "synchronization_records: " << synchronization_.size() << '\n'
           << "alignment_median_m: " << metrics.first << '\n'
           << "alignment_p95_m: " << metrics.second << '\n'
+          << "backend_state: "
+          << (backend == nullptr ? "disabled"
+                                 : jointBackendStateName(backend->state))
+          << '\n'
+          << "backend_accepted: "
+          << (backend != nullptr && backend->accepted ? "true" : "false")
+          << '\n'
           << "extrinsic_errors:\n";
   for (const auto& lidar : manifest.lidars) {
     if (!lidar.enabled || lidar.name == manifest.reference_lidar) continue;
