@@ -8,6 +8,8 @@ estimator/cmake-build-debug
 
 .history
 .vscode
+__pycache__/
+*.py[cod]
 
 build
 build_docker

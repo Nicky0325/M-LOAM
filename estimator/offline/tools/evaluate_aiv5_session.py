@@ -53,6 +53,24 @@ def calibration_transform(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return rotation, translation
 
 
+def manifest_calibration(
+    manifest_path: Path, lidar: dict[str, Any]
+) -> tuple[np.ndarray, np.ndarray]:
+    if "vehicle_T_lidar" in lidar:
+        transform = lidar["vehicle_T_lidar"]
+        translation = np.asarray(transform["translation"], dtype=float)
+        rotation = Rotation.from_euler(
+            "xyz", np.asarray(transform["rpy_deg"], dtype=float), degrees=True
+        ).as_matrix()
+        return rotation, translation
+    if "extrinsic_prototxt" not in lidar:
+        raise ValueError(f"LiDAR {lidar.get('name', '<unnamed>')} has no extrinsic")
+    path = Path(lidar["extrinsic_prototxt"]).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return calibration_transform(path.resolve())
+
+
 def pose_records(pose_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     records: list[tuple[float, np.ndarray, np.ndarray, str]] = []
     for path in sorted(pose_dir.glob("*.prototxt")):
@@ -607,15 +625,18 @@ def report(
 
 def main() -> int:
     options = arguments()
-    manifest = yaml.safe_load(options.manifest.read_text())
-    dataset_root = Path(manifest["dataset_root"])
+    manifest_path = options.manifest.resolve()
+    manifest = yaml.safe_load(manifest_path.read_text())
+    dataset_root = Path(manifest["dataset_root"]).expanduser()
+    if not dataset_root.is_absolute():
+        dataset_root = manifest_path.parent / dataset_root
     pose_dir = options.pose_dir or dataset_root / "vehicle_pose"
     reference_lidar = manifest["reference_lidar"]
 
     trusted_extrinsics: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for lidar in manifest["lidars"]:
-        trusted_extrinsics[lidar["name"]] = calibration_transform(
-            Path(lidar["extrinsic_prototxt"])
+        trusted_extrinsics[lidar["name"]] = manifest_calibration(
+            manifest_path, lidar
         )
     vehicle_r_reference, vehicle_t_reference = trusted_extrinsics[reference_lidar]
     gt_times, gt_positions, gt_quaternions, gt_statuses = pose_records(pose_dir)

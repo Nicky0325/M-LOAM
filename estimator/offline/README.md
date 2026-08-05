@@ -6,6 +6,63 @@ through ROS topics. ROS is still initialized because the existing estimator
 uses ROS time, and `--ros-publish` can enable the existing visualization
 publishers.
 
+## Planar-motion, known-translation calibration
+
+`planar_nav_rotation_calibrator.py` is the recommended prototype when the
+vehicle-frame LiDAR translations are trusted but the rotations can be wrong by
+roughly 10 degrees. It uses the smaller and better-conditioned problem that
+matches this rig instead of asking the original M-LOAM estimator to optimize
+all six extrinsic degrees of freedom:
+
+1. Interpolate the dense `vehicle_pose` DR trajectory and rigidly anchor it to
+   the local ENU trajectory from `ins.txt`.
+2. Select motion pairs with 0.8--6 m of displacement, prioritizing turns.
+3. Measure each LiDAR's relative motion with coarse-to-fine point-to-plane ICP.
+4. Solve `B_ij = X^-1 A_ij X` with a robust loss while keeping the translation
+   part of every `vehicle_T_lidar` exactly constant.
+5. Reject a sensor unless independent held-out motion pairs improve and the
+   3-DoF rotation Hessian is observable.
+6. Write a corrected offline manifest and a colored map built with the
+   GNSS-anchored trajectory.
+
+Validate the 10-degree recovery basin deterministically on all enabled LiDARs:
+
+```bash
+python3 estimator/offline/tools/planar_nav_rotation_calibrator.py \
+  --manifest estimator/config/offline/aiv5_sequence.yaml \
+  --output-dir data/aiv5_planar_nav_10deg \
+  --inject-rotation-error-deg 10 --seed 42
+```
+
+For an actual coarse calibration, omit `--inject-rotation-error-deg`; the
+rotations resolved from the manifest become the starting values. The tool
+requires Python 3, NumPy, SciPy, PyYAML, and Open3D. It produces:
+
+- `summary.yaml`: excitation, GNSS alignment, held-out residuals,
+  observability, uncertainty, and (in injection mode) angular recovery error.
+- `pair_constraints.csv`: every ICP motion pair and its train/held-out status.
+- `corrected_manifest.yaml`: accepted rotations with the original translations
+  copied unchanged and the joint 6-DoF backend disabled.
+- `trajectory_navigation.csv`: GNSS-anchored vehicle and reference-LiDAR poses.
+- `map_initial_rgb.pcd` and `map_optimized_rgb.pcd`: before/after colored maps,
+  plus one optimized map per LiDAR.
+
+Run fixed-extrinsic M-LOAM with the accepted result:
+
+```bash
+rosrun mloam mloam_offline_runner \
+  --manifest data/aiv5_planar_nav_10deg/corrected_manifest.yaml \
+  --scenario precise
+```
+
+Planar motion is not sufficient for unconstrained 6-DoF hand-eye calibration.
+It is sufficient here because translation is known, the vehicle translates in
+the plane, and the route contains substantial yaw. A stationary sequence, a
+near-zero baseline, failed ICP overlap, or motion along only one unchanging
+direction should be treated as unobservable; the tool reports this instead of
+publishing an update. Absolute accuracy remains limited by the supplied DR and
+GNSS/INS trajectory and by scan motion distortion.
+
 ## Joint MLCC-style backend prototype
 
 The runner includes an opt-in, batch joint pose/extrinsic backend based on the
