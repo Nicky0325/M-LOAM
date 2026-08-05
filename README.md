@@ -36,6 +36,15 @@ International Conference on Robotics and Automation (*ICRA*) 2021 , Xi An, China
 
 *If you use M-LOAM for your academic research, please cite one of our paper.* [bib](https://github.com/gogojjh/M-LOAM/blob/mloam_gf/docs/support_files/paper_bib.txt)
 
+## Offline multi-LiDAR extensions
+
+This branch includes an offline PCD runner and a raw-IMU/GNSS-aided calibration
+method for vehicle rigs whose LiDAR translations are known but rotations are
+coarse. It does not use a LiDAR-localizer pose, downstream INS result, or wheel
+result. Start with the [documentation index](docs/README.md), read the
+[calibration methodology](docs/methodology/fixed_translation_planar_multi_lidar_calibration.md),
+or go directly to the [offline operation guide](estimator/offline/README.md).
+
 <!-- ----------------------------------------------------------- -->
 ### 1. Prerequisites
 1.1 **Ubuntu** and **ROS**

@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Navigation-aided, fixed-translation rotation calibration for planar rigs.
+"""Raw IMU/GNSS-aided, fixed-translation rotation calibration for planar rigs.
 
 The estimator deliberately solves a smaller problem than M-LOAM's original
-online 6-DoF calibration.  Vehicle-frame LiDAR translations are treated as
-known constants.  Dense vehicle poses supply relative rig motion, point-to-
-plane ICP measures the corresponding relative motion of each LiDAR, and a
-robust hand-eye solve estimates only the three rotational degrees of freedom::
+online 6-DoF calibration. Vehicle-frame LiDAR translations are treated as
+known constants. Raw dual-antenna GNSS and IMU measurements supply relative
+rig motion, point-to-plane ICP measures the corresponding relative motion of
+each LiDAR, and a robust hand-eye solve estimates only the three rotational
+degrees of freedom::
 
     B_ij = X^-1 A_ij X
 
 Here ``A_ij`` is vehicle motion, ``B_ij`` is LiDAR motion, and ``X`` is the
 vehicle_T_lidar transform whose translation parameter is never changed.
 
-For the AIV5 extraction, the smooth DR pose stream is rigidly anchored to the
-GNSS/INS ENU trajectory.  The same globally anchored trajectory and accepted
-extrinsics can then be used to build a colored, globally consistent map.  An
-optional deterministic perturbation mode is intended for recovery-basin
-validation; it does not expose the trusted rotations to the optimizer.
+The implementation intentionally does not read ``vehicle_pose``, ``ins.txt``,
+or ``wheel.txt``. GNSS positions are interpolated with their measured ENU
+velocities. Gyro-z is integrated and anchored to dual-antenna GNSS heading;
+stationary accelerometer samples provide the small fixed roll/pitch tilt. The
+unknown planar GNSS-antenna lever arm is estimated as a shared nuisance
+parameter while all LiDAR translations remain fixed. The resulting ENU
+trajectory and accepted extrinsics can build a colored global map. An optional
+deterministic perturbation mode validates the recovery basin without exposing
+trusted rotations to the optimizer.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import open3d as o3d
 import yaml
+from scipy.interpolate import CubicHermiteSpline
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation, Slerp
@@ -92,30 +98,53 @@ class RotationCalibration:
 
 
 @dataclass
+class NavigationLeverArmEstimate:
+    value: np.ndarray
+    accepted: bool = False
+    reason: str = ""
+    update_m: float = 0.0
+    hessian_eigenvalues: list[float] = field(default_factory=list)
+    hessian_condition_number: float = math.inf
+    heldout_initial_translation_rmse_m: float = math.inf
+    heldout_final_translation_rmse_m: float = math.inf
+
+
+@dataclass
 class NavigationTrajectory:
     timestamps: np.ndarray
-    local_positions: np.ndarray
-    local_quaternions: np.ndarray
-    global_positions: np.ndarray
-    global_quaternions: np.ndarray
+    antenna_positions: np.ndarray
+    vehicle_quaternions: np.ndarray
     metrics: dict[str, Any]
 
-    def poses(self, timestamps: np.ndarray, *, global_frame: bool) -> np.ndarray:
+    def poses(
+        self,
+        timestamps: np.ndarray,
+        gnss_lever_arm_vehicle: np.ndarray | None = None,
+    ) -> np.ndarray:
         if timestamps.size == 0:
             return np.empty((0, 4, 4))
         if timestamps.min() < self.timestamps[0] or timestamps.max() > self.timestamps[-1]:
             raise ValueError("navigation interpolation requested outside pose coverage")
-        positions = self.global_positions if global_frame else self.local_positions
-        quaternions = self.global_quaternions if global_frame else self.local_quaternions
-        interpolated_positions = np.column_stack(
-            [np.interp(timestamps, self.timestamps, positions[:, axis]) for axis in range(3)]
+        antenna_positions = np.column_stack(
+            [
+                np.interp(timestamps, self.timestamps, self.antenna_positions[:, axis])
+                for axis in range(3)
+            ]
         )
         interpolated_rotations = Slerp(
-            self.timestamps, Rotation.from_quat(quaternions)
+            self.timestamps, Rotation.from_quat(self.vehicle_quaternions)
         )(timestamps).as_matrix()
+        lever_arm = (
+            np.zeros(3)
+            if gnss_lever_arm_vehicle is None
+            else np.asarray(gnss_lever_arm_vehicle, dtype=float)
+        )
+        vehicle_positions = antenna_positions - np.einsum(
+            "nij,j->ni", interpolated_rotations, lever_arm
+        )
         return np.asarray(
             [make_transform(rotation, translation)
-             for rotation, translation in zip(interpolated_rotations, interpolated_positions)]
+             for rotation, translation in zip(interpolated_rotations, vehicle_positions)]
         )
 
 
@@ -123,8 +152,16 @@ def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--pose-dir", type=Path)
-    parser.add_argument("--ins-file", type=Path)
+    parser.add_argument("--imu-file", type=Path)
+    parser.add_argument("--gnss-dir", type=Path)
+    parser.add_argument(
+        "--gnss-heading-to-vehicle-yaw-deg",
+        type=float,
+        help=(
+            "known yaw from the dual-antenna heading frame to vehicle x; "
+            "otherwise estimate it from straight GNSS velocity segments"
+        ),
+    )
     parser.add_argument(
         "--inject-rotation-error-deg",
         type=float,
@@ -140,6 +177,8 @@ def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maximum-range", type=float, default=80.0)
     parser.add_argument("--minimum-constraints", type=int, default=12)
     parser.add_argument("--rotation-update-bound-deg", type=float, default=15.0)
+    parser.add_argument("--gnss-lever-arm-bound-m", type=float, default=10.0)
+    parser.add_argument("--lever-arm-outer-iterations", type=int, default=15)
     parser.add_argument("--map-stride", type=int, default=10)
     parser.add_argument("--map-voxel-size", type=float, default=0.35)
     parser.add_argument("--skip-map", action="store_true")
@@ -162,6 +201,18 @@ def inverse(transform: np.ndarray) -> np.ndarray:
     result[:3, :3] = transform[:3, :3].T
     result[:3, 3] = -result[:3, :3] @ transform[:3, 3]
     return result
+
+
+def motion_at_vehicle_origin(
+    antenna_motion: np.ndarray, gnss_lever_arm_vehicle: np.ndarray | None
+) -> np.ndarray:
+    """Shift a relative motion from the GNSS antenna to the vehicle origin."""
+    if gnss_lever_arm_vehicle is None:
+        return antenna_motion
+    vehicle_t_antenna = make_transform(
+        np.eye(3), np.asarray(gnss_lever_arm_vehicle, dtype=float)
+    )
+    return vehicle_t_antenna @ antenna_motion @ inverse(vehicle_t_antenna)
 
 
 def angular_distance_degrees(first: np.ndarray, second: np.ndarray) -> float:
@@ -238,124 +289,341 @@ def load_lidars(
     return result
 
 
-def vehicle_pose_records(pose_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    records: list[tuple[float, np.ndarray, np.ndarray, str]] = []
-    for path in pose_dir.glob("*.prototxt"):
-        text = path.read_text()
-        time_match = re.search(r"\btime_meas\s*:\s*(\d+)", text)
-        timestamp = int(time_match.group(1)) * 1.0e-9 if time_match else float(path.stem)
-        position = block_vector(text, "pos")
-        rpy = block_vector(text, "attitude_rpy")
-        status_match = re.search(r"^status\s*:\s*(\S+)", text, re.M)
-        records.append(
-            (timestamp, position, rpy, status_match.group(1) if status_match else "UNKNOWN")
+def scalar_field(text: str, name: str) -> float:
+    match = re.search(rf"\b{re.escape(name)}\s*:\s*([-+0-9.eE]+)", text)
+    if not match:
+        raise ValueError(f"missing {name}")
+    return float(match.group(1))
+
+
+def word_field(text: str, name: str, default: str = "UNKNOWN") -> str:
+    match = re.search(rf"\b{re.escape(name)}\s*:\s*(\S+)", text)
+    return match.group(1) if match else default
+
+
+def lla_to_enu(lla: np.ndarray) -> np.ndarray:
+    """Convert geodetic coordinates to a local WGS84 ENU frame."""
+    coordinates = np.asarray(lla, dtype=float).copy()
+    if np.max(np.abs(coordinates[:, 0])) > math.pi / 2.0 + 0.1:
+        coordinates[:, :2] = np.deg2rad(coordinates[:, :2])
+    latitude = coordinates[:, 0]
+    longitude = coordinates[:, 1]
+    altitude = coordinates[:, 2]
+    semi_major = 6378137.0
+    eccentricity_squared = 6.69437999014e-3
+    prime_vertical = semi_major / np.sqrt(
+        1.0 - eccentricity_squared * np.square(np.sin(latitude))
+    )
+    ecef = np.column_stack(
+        (
+            (prime_vertical + altitude) * np.cos(latitude) * np.cos(longitude),
+            (prime_vertical + altitude) * np.cos(latitude) * np.sin(longitude),
+            (prime_vertical * (1.0 - eccentricity_squared) + altitude)
+            * np.sin(latitude),
         )
-    if not records:
-        raise ValueError(f"no vehicle poses found in {pose_dir}")
-    records.sort(key=lambda item: item[0])
-    timestamps = np.asarray([item[0] for item in records])
-    unique = np.concatenate(([True], np.diff(timestamps) > 0.0))
-    positions = np.asarray([item[1] for item in records])[unique]
-    quaternions = Rotation.from_euler(
-        "xyz", np.asarray([item[2] for item in records])[unique]
-    ).as_quat()
-    statuses = [item[3] for item, keep in zip(records, unique) if keep]
-    return timestamps[unique], positions, quaternions, statuses
+    )
+    latitude0 = float(latitude[0])
+    longitude0 = float(longitude[0])
+    ecef_to_enu = np.asarray(
+        [
+            [-math.sin(longitude0), math.cos(longitude0), 0.0],
+            [
+                -math.sin(latitude0) * math.cos(longitude0),
+                -math.sin(latitude0) * math.sin(longitude0),
+                math.cos(latitude0),
+            ],
+            [
+                math.cos(latitude0) * math.cos(longitude0),
+                math.cos(latitude0) * math.sin(longitude0),
+                math.sin(latitude0),
+            ],
+        ]
+    )
+    return (ecef_to_enu @ (ecef - ecef[0]).T).T
 
 
-def rigid_alignment_2d(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    source_center = source.mean(axis=0)
-    target_center = target.mean(axis=0)
-    u, _, vt = np.linalg.svd((source - source_center).T @ (target - target_center))
-    rotation = vt.T @ u.T
-    if np.linalg.det(rotation) < 0.0:
-        vt[-1, :] *= -1.0
-        rotation = vt.T @ u.T
-    translation = target_center - rotation @ source_center
-    return rotation, translation
+def circular_mean(values: np.ndarray) -> float:
+    return float(np.angle(np.mean(np.exp(1j * values))))
 
 
-def load_navigation(pose_dir: Path, ins_file: Path | None) -> NavigationTrajectory:
-    timestamps, positions, quaternions, statuses = vehicle_pose_records(pose_dir)
-    local_rotations = Rotation.from_quat(quaternions)
-    relative = local_rotations[:-1].inv() * local_rotations[1:]
-    dt = np.diff(timestamps)
-    step = np.linalg.norm(np.diff(positions, axis=0), axis=1)
-    rpy_deg = local_rotations.as_euler("xyz", degrees=True)
-    unwrapped_yaw = np.unwrap(np.deg2rad(rpy_deg[:, 2]))
-    metrics: dict[str, Any] = {
-        "pose_samples": int(timestamps.size),
-        "duration_s": float(timestamps[-1] - timestamps[0]),
-        "path_length_m": float(step.sum()),
-        "position_span_m": np.ptp(positions, axis=0).tolist(),
-        "rpy_span_deg": np.ptp(rpy_deg, axis=0).tolist(),
-        "yaw_net_deg": float(np.rad2deg(unwrapped_yaw[-1] - unwrapped_yaw[0])),
-        "yaw_total_deg": float(np.rad2deg(np.abs(np.diff(unwrapped_yaw)).sum())),
-        "maximum_angular_rate_deg_s": float(np.max(np.rad2deg(relative.magnitude()) / dt)),
-        "status_counts": {status: statuses.count(status) for status in sorted(set(statuses))},
-        "gnss_anchor_available": False,
-    }
+def wrapped_angle(values: np.ndarray) -> np.ndarray:
+    return np.angle(np.exp(1j * values))
 
-    global_positions = positions.copy()
-    global_quaternions = quaternions.copy()
-    if ins_file is not None and ins_file.is_file():
-        ins = np.genfromtxt(ins_file, delimiter=",", skip_header=1)
-        ins = np.atleast_2d(ins)
-        finite = np.all(np.isfinite(ins[:, :7]), axis=1)
-        ins = ins[finite]
-        if ins.shape[0] >= 2:
-            earth_radius_m = 6378137.0
-            latitude0_rad = math.radians(float(ins[0, 1]))
-            enu = np.column_stack(
-                (
-                    np.deg2rad(ins[:, 2] - ins[0, 2])
-                    * earth_radius_m
-                    * math.cos(latitude0_rad),
-                    np.deg2rad(ins[:, 1] - ins[0, 1]) * earth_radius_m,
-                    ins[:, 3] - ins[0, 3],
-                )
+
+def load_raw_navigation(
+    imu_file: Path,
+    gnss_dir: Path,
+    heading_to_vehicle_yaw_deg: float | None,
+) -> NavigationTrajectory:
+    """Build an ENU pose stream using only raw IMU and dual-antenna GNSS."""
+    imu = np.genfromtxt(imu_file, delimiter=",", skip_header=1)
+    imu = np.atleast_2d(imu)
+    if imu.shape[1] < 7:
+        raise ValueError(f"IMU file has fewer than seven columns: {imu_file}")
+    imu = imu[np.all(np.isfinite(imu[:, :7]), axis=1), :7]
+    imu = imu[np.argsort(imu[:, 0])]
+    imu = imu[np.concatenate(([True], np.diff(imu[:, 0]) > 0.0))]
+    if imu.shape[0] < 100:
+        raise ValueError(f"need at least 100 finite IMU records; got {imu.shape[0]}")
+
+    records: list[dict[str, Any]] = []
+    for path in sorted(gnss_dir.glob("*.prototxt")):
+        text = path.read_text()
+        records.append(
+            {
+                "position_time": scalar_field(text, "pos_time_gps") * 1.0e-9,
+                "heading_time": scalar_field(text, "heading_time_gps") * 1.0e-9,
+                "lla": block_vector(text, "lla"),
+                "velocity": block_vector(text, "velocity_enu"),
+                "velocity_std": block_vector(text, "velocity_std"),
+                "yaw": block_vector(text, "attitude_rpy")[2],
+                "yaw_std": block_vector(text, "attitude_std")[2],
+                "position_status": word_field(text, "pos_status"),
+                "heading_status": word_field(text, "heading_status"),
+                "heading_usable": word_field(text, "heading_usable", "false")
+                == "true",
+            }
+        )
+    if len(records) < 20:
+        raise ValueError(f"need at least 20 GNSS records in {gnss_dir}; got {len(records)}")
+
+    position_records = [
+        record
+        for record in records
+        if record["position_status"] != "INVALID"
+        and np.all(np.isfinite(record["lla"]))
+        and np.all(np.isfinite(record["velocity"]))
+    ]
+    heading_records = [
+        record
+        for record in records
+        if record["heading_usable"]
+        and record["heading_status"] != "INVALID"
+        and math.isfinite(record["yaw"])
+    ]
+    if len(position_records) < 20 or len(heading_records) < 20:
+        raise ValueError(
+            "raw GNSS lacks at least 20 usable position and dual-heading records"
+        )
+
+    position_records.sort(key=lambda item: item["position_time"])
+    heading_records.sort(key=lambda item: item["heading_time"])
+    position_times = np.asarray(
+        [record["position_time"] for record in position_records]
+    )
+    position_unique = np.concatenate(([True], np.diff(position_times) > 0.0))
+    position_times = position_times[position_unique]
+    lla = np.asarray([record["lla"] for record in position_records])[position_unique]
+    velocities = np.asarray(
+        [record["velocity"] for record in position_records]
+    )[position_unique]
+    velocity_std = np.asarray(
+        [record["velocity_std"] for record in position_records]
+    )[position_unique]
+    antenna_positions = lla_to_enu(lla)
+
+    heading_times = np.asarray(
+        [record["heading_time"] for record in heading_records]
+    )
+    heading_unique = np.concatenate(([True], np.diff(heading_times) > 0.0))
+    heading_times = heading_times[heading_unique]
+    heading_yaw = np.unwrap(
+        np.asarray([record["yaw"] for record in heading_records])[heading_unique]
+    )
+    heading_std = np.asarray(
+        [record["yaw_std"] for record in heading_records]
+    )[heading_unique]
+    if np.max(np.diff(position_times)) > 1.0:
+        raise ValueError("GNSS position gap exceeds 1.0 second")
+    if np.max(np.diff(heading_times)) > 1.0:
+        raise ValueError("GNSS heading gap exceeds 1.0 second")
+
+    imu_times = imu[:, 0]
+    accelerometer = imu[:, 1:4]
+    gyroscope = imu[:, 4:7]
+    speed = np.linalg.norm(velocities[:, :2], axis=1)
+    speed_at_imu = np.interp(
+        imu_times, position_times, speed, left=math.inf, right=math.inf
+    )
+    acceleration_norm = np.linalg.norm(accelerometer, axis=1)
+    stationary = (
+        (speed_at_imu < 0.10)
+        & (acceleration_norm > 8.0)
+        & (acceleration_norm < 11.5)
+    )
+    if np.count_nonzero(stationary) < 50:
+        raise ValueError(
+            "need at least 50 stationary IMU samples to initialize gravity and gyro bias"
+        )
+    gyro_bias = np.median(gyroscope[stationary], axis=0)
+    gravity_body = np.median(accelerometer[stationary], axis=0)
+    fixed_roll = math.atan2(gravity_body[1], gravity_body[2])
+    fixed_pitch = math.atan2(
+        -gravity_body[0], math.hypot(gravity_body[1], gravity_body[2])
+    )
+
+    corrected_gyro_z = gyroscope[:, 2] - gyro_bias[2]
+    integrated_yaw = np.zeros(imu_times.size)
+    integrated_yaw[1:] = np.cumsum(
+        0.5
+        * (corrected_gyro_z[:-1] + corrected_gyro_z[1:])
+        * np.diff(imu_times)
+    )
+    heading_overlap = (
+        (heading_times >= imu_times[0]) & (heading_times <= imu_times[-1])
+    )
+    if np.count_nonzero(heading_overlap) < 20:
+        raise ValueError("fewer than 20 GNSS headings overlap the IMU")
+    fit_times = heading_times[heading_overlap]
+    fit_yaw = heading_yaw[heading_overlap]
+    integrated_at_heading = np.interp(fit_times, imu_times, integrated_yaw)
+    fit_x = fit_times - imu_times[0]
+
+    def heading_fit_residual(parameters: np.ndarray) -> np.ndarray:
+        return integrated_at_heading + parameters[0] + parameters[1] * fit_x - fit_yaw
+
+    heading_fit = least_squares(
+        heading_fit_residual,
+        np.asarray([float(np.median(fit_yaw - integrated_at_heading)), 0.0]),
+        loss="cauchy",
+        f_scale=math.radians(0.5),
+        max_nfev=100,
+    )
+    if not heading_fit.success:
+        raise ValueError(f"IMU/GNSS heading fusion failed: {heading_fit.message}")
+    yaw_heading_frame = (
+        integrated_yaw
+        + heading_fit.x[0]
+        + heading_fit.x[1] * (imu_times - imu_times[0])
+    )
+    heading_fit_error = wrapped_angle(heading_fit_residual(heading_fit.x))
+
+    if heading_to_vehicle_yaw_deg is None:
+        position_overlap = (
+            (position_times >= imu_times[0])
+            & (position_times <= imu_times[-1])
+        )
+        yaw_at_position = np.interp(
+            position_times[position_overlap], imu_times, yaw_heading_frame
+        )
+        yaw_rate_at_position = np.interp(
+            position_times[position_overlap], imu_times, corrected_gyro_z
+        )
+        moving_straight = (
+            (speed[position_overlap] >= 2.0)
+            & (np.abs(yaw_rate_at_position) <= 0.02)
+        )
+        course = np.arctan2(
+            velocities[position_overlap, 1], velocities[position_overlap, 0]
+        )
+        offsets = wrapped_angle(course[moving_straight] - yaw_at_position[moving_straight])
+        if offsets.size < 20:
+            raise ValueError(
+                "cannot infer GNSS-heading-to-vehicle yaw: need 20 samples with "
+                "speed >= 2 m/s and |yaw rate| <= 0.02 rad/s; provide "
+                "--gnss-heading-to-vehicle-yaw-deg"
             )
-            common = (timestamps >= ins[0, 0]) & (timestamps <= ins[-1, 0])
-            if np.count_nonzero(common) >= 10:
-                interpolated_enu = np.column_stack(
-                    [np.interp(timestamps[common], ins[:, 0], enu[:, axis]) for axis in range(3)]
-                )
-                rotation2, translation2 = rigid_alignment_2d(
-                    positions[common, :2], interpolated_enu[:, :2]
-                )
-                global_positions[:, :2] = (
-                    rotation2 @ positions[:, :2].T
-                ).T + translation2
-                z_offset = float(np.median(interpolated_enu[:, 2] - positions[common, 2]))
-                global_positions[:, 2] = positions[:, 2] + z_offset
-                yaw = math.atan2(rotation2[1, 0], rotation2[0, 0])
-                world_rotation = Rotation.from_euler("z", yaw)
-                global_quaternions = (world_rotation * local_rotations).as_quat()
-                aligned_error = np.linalg.norm(
-                    global_positions[common, :2] - interpolated_enu[:, :2], axis=1
-                )
-                metrics.update(
-                    {
-                        "gnss_anchor_available": True,
-                        "ins_samples": int(ins.shape[0]),
-                        "ins_status_counts": {
-                            str(int(value)): int(count)
-                            for value, count in zip(*np.unique(ins[:, -1], return_counts=True))
-                        },
-                        "dr_to_ins_yaw_deg": math.degrees(yaw),
-                        "dr_to_ins_position_rmse_m": float(
-                            np.sqrt(np.mean(np.square(aligned_error)))
-                        ),
-                        "dr_to_ins_position_p95_m": float(np.percentile(aligned_error, 95)),
-                        "dr_to_ins_position_max_m": float(np.max(aligned_error)),
-                    }
-                )
+        heading_to_vehicle_yaw = circular_mean(offsets)
+        for _ in range(3):
+            errors = wrapped_angle(offsets - heading_to_vehicle_yaw)
+            scale = 1.4826 * float(np.median(np.abs(errors)))
+            inliers = np.abs(errors) <= max(math.radians(2.0), 3.0 * scale)
+            if np.count_nonzero(inliers) < 20:
+                break
+            heading_to_vehicle_yaw = circular_mean(offsets[inliers])
+        alignment_errors = wrapped_angle(offsets - heading_to_vehicle_yaw)
+        alignment_source = "estimated_from_straight_gnss_velocity"
+        alignment_samples = int(offsets.size)
+        alignment_p95_deg = float(
+            np.rad2deg(np.percentile(np.abs(alignment_errors), 95))
+        )
+        if alignment_p95_deg > 5.0:
+            raise ValueError(
+                "GNSS heading-to-vehicle yaw is inconsistent with straight-line "
+                f"velocity (p95 {alignment_p95_deg:.2f} deg)"
+            )
+    else:
+        heading_to_vehicle_yaw = math.radians(heading_to_vehicle_yaw_deg)
+        alignment_source = "command_line"
+        alignment_samples = 0
+        alignment_p95_deg = 0.0
+
+    navigation_start = max(
+        imu_times[0], position_times[0], heading_times[0]
+    )
+    navigation_end = min(
+        imu_times[-1], position_times[-1], heading_times[-1]
+    )
+    covered = (imu_times >= navigation_start) & (imu_times <= navigation_end)
+    navigation_times = imu_times[covered]
+    position_spline = CubicHermiteSpline(
+        position_times, antenna_positions, velocities, axis=0
+    )
+    dense_positions = np.asarray(position_spline(navigation_times))
+    dense_yaw = yaw_heading_frame[covered] + heading_to_vehicle_yaw
+    dense_rpy = np.column_stack(
+        (
+            np.full(navigation_times.size, fixed_roll),
+            np.full(navigation_times.size, fixed_pitch),
+            dense_yaw,
+        )
+    )
+    quaternions = Rotation.from_euler("xyz", dense_rpy).as_quat()
+    step = np.linalg.norm(np.diff(dense_positions, axis=0), axis=1)
+    position_statuses = [record["position_status"] for record in records]
+    heading_statuses = [record["heading_status"] for record in records]
+    metrics: dict[str, Any] = {
+        "source": "raw_imu_and_dual_antenna_gnss",
+        "uses_vehicle_pose": False,
+        "uses_ins_txt": False,
+        "uses_wheel": False,
+        "imu_samples": int(imu.shape[0]),
+        "gnss_position_samples": int(position_times.size),
+        "gnss_heading_samples": int(heading_times.size),
+        "pose_samples": int(navigation_times.size),
+        "duration_s": float(navigation_times[-1] - navigation_times[0]),
+        "path_length_m": float(step.sum()),
+        "position_span_m": np.ptp(dense_positions, axis=0).tolist(),
+        "rpy_span_deg": np.rad2deg(np.ptp(dense_rpy, axis=0)).tolist(),
+        "yaw_net_deg": float(np.rad2deg(dense_yaw[-1] - dense_yaw[0])),
+        "yaw_total_deg": float(np.rad2deg(np.abs(np.diff(dense_yaw)).sum())),
+        "maximum_angular_rate_deg_s": float(
+            np.rad2deg(np.max(np.abs(corrected_gyro_z[covered])))
+        ),
+        "gnss_position_status_counts": {
+            status: position_statuses.count(status)
+            for status in sorted(set(position_statuses))
+        },
+        "gnss_heading_status_counts": {
+            status: heading_statuses.count(status)
+            for status in sorted(set(heading_statuses))
+        },
+        "maximum_gnss_position_gap_s": float(np.max(np.diff(position_times))),
+        "maximum_gnss_heading_gap_s": float(np.max(np.diff(heading_times))),
+        "median_velocity_std_m_s": np.median(velocity_std, axis=0).tolist(),
+        "median_heading_std_deg": float(np.rad2deg(np.median(heading_std))),
+        "stationary_imu_samples": int(np.count_nonzero(stationary)),
+        "gyro_bias_rad_s": gyro_bias.tolist(),
+        "fixed_roll_pitch_from_gravity_deg": [
+            math.degrees(fixed_roll),
+            math.degrees(fixed_pitch),
+        ],
+        "heading_fit_bias_correction_rad_s": float(heading_fit.x[1]),
+        "heading_fit_rmse_deg": float(
+            np.rad2deg(np.sqrt(np.mean(np.square(heading_fit_error))))
+        ),
+        "heading_fit_p95_deg": float(
+            np.rad2deg(np.percentile(np.abs(heading_fit_error), 95))
+        ),
+        "heading_to_vehicle_yaw_deg": math.degrees(heading_to_vehicle_yaw),
+        "heading_to_vehicle_yaw_source": alignment_source,
+        "heading_alignment_samples": alignment_samples,
+        "heading_alignment_p95_deg": alignment_p95_deg,
+    }
     return NavigationTrajectory(
-        timestamps=timestamps,
-        local_positions=positions,
-        local_quaternions=quaternions,
-        global_positions=global_positions,
-        global_quaternions=global_quaternions,
+        timestamps=navigation_times,
+        antenna_positions=dense_positions,
+        vehicle_quaternions=quaternions,
         metrics=metrics,
     )
 
@@ -406,7 +674,7 @@ def select_pairs(
     )
     if valid.size < frame_gap + 1:
         return []
-    poses = navigation.poses(scan_times[valid], global_frame=False)
+    poses = navigation.poses(scan_times[valid])
     pose_by_index = {int(index): pose for index, pose in zip(valid, poses)}
     candidates: list[PairCandidate] = []
     for first in valid[::candidate_stride]:
@@ -497,6 +765,7 @@ def collect_constraints(
     voxel_size: float,
     minimum_range: float,
     maximum_range: float,
+    gnss_lever_arm_vehicle: np.ndarray | None = None,
 ) -> list[PairConstraint]:
     cache: dict[int, o3d.geometry.PointCloud] = {}
     initial_extrinsic = make_transform(initial_rotation, lidar.translation)
@@ -512,7 +781,10 @@ def collect_constraints(
                     maximum_range,
                     estimate_normals=True,
                 )
-        predicted = initial_inverse @ candidate.vehicle_motion @ initial_extrinsic
+        vehicle_motion = motion_at_vehicle_origin(
+            candidate.vehicle_motion, gnss_lever_arm_vehicle
+        )
+        predicted = initial_inverse @ vehicle_motion @ initial_extrinsic
         measured, fitness, inlier_rmse = multiscale_icp(
             cache[candidate.second], cache[candidate.first], predicted, voxel_size
         )
@@ -553,14 +825,18 @@ def handeye_residual(
     initial_rotation: np.ndarray,
     fixed_translation: np.ndarray,
     constraints: Sequence[PairConstraint],
+    gnss_lever_arm_vehicle: np.ndarray | None = None,
 ) -> np.ndarray:
     rotation = initial_rotation @ Rotation.from_rotvec(delta).as_matrix()
     extrinsic = make_transform(rotation, fixed_translation)
     extrinsic_inverse = inverse(extrinsic)
     residuals: list[float] = []
     for constraint in constraints:
+        vehicle_motion = motion_at_vehicle_origin(
+            constraint.candidate.vehicle_motion, gnss_lever_arm_vehicle
+        )
         predicted = (
-            extrinsic_inverse @ constraint.candidate.vehicle_motion @ extrinsic
+            extrinsic_inverse @ vehicle_motion @ extrinsic
         )
         measured = constraint.lidar_motion
         rotation_error = Rotation.from_matrix(
@@ -579,6 +855,7 @@ def constraint_metrics(
     rotation: np.ndarray,
     translation: np.ndarray,
     constraints: Sequence[PairConstraint],
+    gnss_lever_arm_vehicle: np.ndarray | None = None,
 ) -> dict[str, float]:
     if not constraints:
         return {
@@ -593,8 +870,11 @@ def constraint_metrics(
     translation_errors: list[float] = []
     rotation_errors: list[float] = []
     for constraint in constraints:
+        vehicle_motion = motion_at_vehicle_origin(
+            constraint.candidate.vehicle_motion, gnss_lever_arm_vehicle
+        )
         predicted = (
-            extrinsic_inverse @ constraint.candidate.vehicle_motion @ extrinsic
+            extrinsic_inverse @ vehicle_motion @ extrinsic
         )
         measured = constraint.lidar_motion
         translation_errors.append(
@@ -621,6 +901,7 @@ def calibrate_rotation(
     minimum_constraints: int,
     update_bound_deg: float,
     trusted_rotation: np.ndarray | None,
+    gnss_lever_arm_vehicle: np.ndarray | None = None,
 ) -> RotationCalibration:
     result = RotationCalibration(
         name=lidar.name,
@@ -649,7 +930,12 @@ def calibrate_rotation(
     solution = least_squares(
         handeye_residual,
         np.zeros(3),
-        args=(initial_rotation, lidar.translation, training),
+        args=(
+            initial_rotation,
+            lidar.translation,
+            training,
+            gnss_lever_arm_vehicle,
+        ),
         bounds=(-bound, bound),
         loss="cauchy",
         f_scale=1.0,
@@ -661,16 +947,28 @@ def calibrate_rotation(
     result.optimized_rotation = optimized_rotation
     result.update_deg = float(np.rad2deg(np.linalg.norm(solution.x)))
     result.train_initial = constraint_metrics(
-        initial_rotation, lidar.translation, training
+        initial_rotation,
+        lidar.translation,
+        training,
+        gnss_lever_arm_vehicle,
     )
     result.train_final = constraint_metrics(
-        optimized_rotation, lidar.translation, training
+        optimized_rotation,
+        lidar.translation,
+        training,
+        gnss_lever_arm_vehicle,
     )
     result.heldout_initial = constraint_metrics(
-        initial_rotation, lidar.translation, heldout
+        initial_rotation,
+        lidar.translation,
+        heldout,
+        gnss_lever_arm_vehicle,
     )
     result.heldout_final = constraint_metrics(
-        optimized_rotation, lidar.translation, heldout
+        optimized_rotation,
+        lidar.translation,
+        heldout,
+        gnss_lever_arm_vehicle,
     )
     if trusted_rotation is not None:
         result.trusted_final_error_deg = angular_distance_degrees(
@@ -723,6 +1021,136 @@ def calibrate_rotation(
         result.reason = "held-out rotation consistency regressed"
     else:
         result.reason = "accepted: fixed-translation hand-eye validation passed"
+    return result
+
+
+def lever_arm_translation_errors(
+    lidars: dict[str, LidarDefinition],
+    calibrations: dict[str, RotationCalibration],
+    lever_arm: np.ndarray,
+    split: str,
+) -> np.ndarray:
+    errors: list[float] = []
+    for name, calibration in calibrations.items():
+        extrinsic = make_transform(
+            calibration.optimized_rotation, lidars[name].translation
+        )
+        extrinsic_inverse = inverse(extrinsic)
+        for constraint in calibration.constraints:
+            if not constraint.accepted or constraint.split != split:
+                continue
+            vehicle_motion = motion_at_vehicle_origin(
+                constraint.candidate.vehicle_motion, lever_arm
+            )
+            predicted = extrinsic_inverse @ vehicle_motion @ extrinsic
+            errors.append(
+                float(np.linalg.norm(predicted[:3, 3] - constraint.lidar_motion[:3, 3]))
+            )
+    return np.asarray(errors)
+
+
+def estimate_gnss_lever_arm(
+    lidar_definitions: Sequence[LidarDefinition],
+    calibrations: dict[str, RotationCalibration],
+    initial_lever_arm: np.ndarray,
+    bound_m: float,
+) -> NavigationLeverArmEstimate:
+    """Estimate the shared planar vehicle-to-GNSS antenna translation."""
+    definitions = {lidar.name: lidar for lidar in lidar_definitions}
+    result = NavigationLeverArmEstimate(value=initial_lever_arm.copy())
+    training_count = sum(
+        constraint.accepted and constraint.split == "train"
+        for calibration in calibrations.values()
+        for constraint in calibration.constraints
+    )
+    heldout_count = sum(
+        constraint.accepted and constraint.split == "heldout"
+        for calibration in calibrations.values()
+        for constraint in calibration.constraints
+    )
+    if training_count < 6 or heldout_count < 2:
+        result.reason = "not enough train/held-out constraints for GNSS lever arm"
+        return result
+
+    def residual(planar_lever_arm: np.ndarray) -> np.ndarray:
+        lever_arm = np.asarray(
+            [planar_lever_arm[0], planar_lever_arm[1], 0.0], dtype=float
+        )
+        values: list[float] = []
+        for name, calibration in calibrations.items():
+            extrinsic = make_transform(
+                calibration.optimized_rotation, definitions[name].translation
+            )
+            extrinsic_inverse = inverse(extrinsic)
+            for constraint in calibration.constraints:
+                if not constraint.accepted or constraint.split != "train":
+                    continue
+                vehicle_motion = motion_at_vehicle_origin(
+                    constraint.candidate.vehicle_motion, lever_arm
+                )
+                predicted = extrinsic_inverse @ vehicle_motion @ extrinsic
+                weight = math.sqrt(max(0.05, constraint.fitness)) / max(
+                    0.10, constraint.inlier_rmse_m
+                )
+                values.extend(
+                    weight
+                    * (predicted[:3, 3] - constraint.lidar_motion[:3, 3])
+                )
+        return np.asarray(values)
+
+    solution = least_squares(
+        residual,
+        initial_lever_arm[:2],
+        bounds=(-bound_m, bound_m),
+        loss="cauchy",
+        f_scale=1.0,
+        max_nfev=200,
+    )
+    result.value = np.asarray([solution.x[0], solution.x[1], 0.0])
+    result.update_m = float(np.linalg.norm(result.value - initial_lever_arm))
+    hessian = solution.jac.T @ solution.jac
+    eigenvalues = np.linalg.eigvalsh(hessian)
+    result.hessian_eigenvalues = eigenvalues.tolist()
+    result.hessian_condition_number = (
+        float(eigenvalues[-1] / eigenvalues[0])
+        if eigenvalues[0] > 0.0
+        else math.inf
+    )
+    initial_errors = lever_arm_translation_errors(
+        definitions, calibrations, initial_lever_arm, "heldout"
+    )
+    final_errors = lever_arm_translation_errors(
+        definitions, calibrations, result.value, "heldout"
+    )
+    result.heldout_initial_translation_rmse_m = float(
+        np.sqrt(np.mean(np.square(initial_errors)))
+    )
+    result.heldout_final_translation_rmse_m = float(
+        np.sqrt(np.mean(np.square(final_errors)))
+    )
+    observable = (
+        eigenvalues[0] > 1.0e-9
+        and math.isfinite(result.hessian_condition_number)
+        and result.hessian_condition_number < 1.0e6
+    )
+    bounded = np.linalg.norm(result.value[:2]) <= 1.05 * bound_m
+    heldout_not_regressed = (
+        result.heldout_final_translation_rmse_m
+        <= 1.05 * result.heldout_initial_translation_rmse_m
+    )
+    result.accepted = bool(
+        solution.success and observable and bounded and heldout_not_regressed
+    )
+    if not solution.success:
+        result.reason = f"GNSS lever-arm solve failed: {solution.message}"
+    elif not observable:
+        result.reason = "GNSS planar lever arm is rank-deficient or ill-conditioned"
+    elif not bounded:
+        result.reason = "GNSS planar lever arm exceeded configured bound"
+    elif not heldout_not_regressed:
+        result.reason = "GNSS lever arm regressed held-out translation consistency"
+    else:
+        result.reason = "accepted: shared planar GNSS lever arm is observable"
     return result
 
 
@@ -792,6 +1220,7 @@ def build_maps(
     lidars: Sequence[LidarDefinition],
     calibrations: dict[str, RotationCalibration],
     navigation: NavigationTrajectory,
+    gnss_lever_arm_vehicle: np.ndarray,
     stride: int,
     voxel_size: float,
     minimum_range: float,
@@ -811,7 +1240,7 @@ def build_maps(
             (timestamps >= navigation.timestamps[0])
             & (timestamps <= navigation.timestamps[-1])
         )[::stride]
-        poses = navigation.poses(timestamps[valid], global_frame=True)
+        poses = navigation.poses(timestamps[valid], gnss_lever_arm_vehicle)
         calibration = calibrations[lidar.name]
         initial_extrinsic = make_transform(
             calibration.initial_rotation, calibration.fixed_translation
@@ -998,9 +1427,11 @@ def relative_extrinsics_document(
     errors = np.asarray([item["rotation_error_deg"] for item in pair_errors])
     metrics = {
         "pairs": pair_errors,
-        "mean_rotation_error_deg": float(np.mean(errors)),
-        "p95_rotation_error_deg": float(np.percentile(errors, 95)),
-        "maximum_rotation_error_deg": float(np.max(errors)),
+        "mean_rotation_error_deg": float(np.mean(errors)) if errors.size else 0.0,
+        "p95_rotation_error_deg": (
+            float(np.percentile(errors, 95)) if errors.size else 0.0
+        ),
+        "maximum_rotation_error_deg": float(np.max(errors)) if errors.size else 0.0,
     }
     return output, metrics
 
@@ -1048,6 +1479,7 @@ def write_trajectory(
     reference: LidarDefinition,
     calibration: RotationCalibration,
     navigation: NavigationTrajectory,
+    gnss_lever_arm_vehicle: np.ndarray,
 ) -> None:
     files, timestamps = scan_index(reference.directory)
     del files
@@ -1055,7 +1487,7 @@ def write_trajectory(
         (timestamps >= navigation.timestamps[0])
         & (timestamps <= navigation.timestamps[-1])
     )
-    poses = navigation.poses(timestamps[valid], global_frame=True)
+    poses = navigation.poses(timestamps[valid], gnss_lever_arm_vehicle)
     extrinsic = make_transform(
         calibration.optimized_rotation, calibration.fixed_translation
     )
@@ -1081,15 +1513,17 @@ def write_trajectory(
                 "reference_qw",
             ]
         )
-        for index, timestamp, vehicle_pose in zip(valid, timestamps[valid], poses):
-            reference_pose = vehicle_pose @ extrinsic
-            vehicle_quaternion = Rotation.from_matrix(vehicle_pose[:3, :3]).as_quat()
+        for index, timestamp, world_t_vehicle in zip(valid, timestamps[valid], poses):
+            reference_pose = world_t_vehicle @ extrinsic
+            vehicle_quaternion = Rotation.from_matrix(
+                world_t_vehicle[:3, :3]
+            ).as_quat()
             reference_quaternion = Rotation.from_matrix(reference_pose[:3, :3]).as_quat()
             writer.writerow(
                 [
                     int(index),
                     float(timestamp),
-                    *vehicle_pose[:3, 3].tolist(),
+                    *world_t_vehicle[:3, 3].tolist(),
                     *vehicle_quaternion.tolist(),
                     *reference_pose[:3, 3].tolist(),
                     *reference_quaternion.tolist(),
@@ -1147,28 +1581,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     options = arguments(argv)
     if options.inject_rotation_error_deg < 0.0:
         raise ValueError("injected rotation error must be non-negative")
+    if options.gnss_lever_arm_bound_m <= 0.0:
+        raise ValueError("GNSS lever-arm bound must be positive")
+    if options.lever_arm_outer_iterations <= 0:
+        raise ValueError("lever-arm outer iterations must be positive")
     manifest_path = options.manifest.resolve()
     manifest = yaml.safe_load(manifest_path.read_text())
     include = set(options.include.split(",")) if options.include else None
     lidars = load_lidars(manifest_path, manifest, include)
     dataset_root = resolve_path(manifest_path.parent, str(manifest["dataset_root"]))
-    pose_dir = options.pose_dir or dataset_root / "vehicle_pose"
-    ins_file = options.ins_file or dataset_root / "ins.txt"
+    imu_file = options.imu_file or dataset_root / "imu.txt"
+    gnss_dir = options.gnss_dir or dataset_root / "gnss"
     output_dir = options.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading and GNSS-anchoring navigation from {pose_dir}", flush=True)
-    navigation = load_navigation(pose_dir, ins_file)
+    print(
+        f"Loading raw navigation from IMU {imu_file} and GNSS {gnss_dir}",
+        flush=True,
+    )
+    navigation = load_raw_navigation(
+        imu_file, gnss_dir, options.gnss_heading_to_vehicle_yaw_deg
+    )
     print(
         f"Excitation: {navigation.metrics['path_length_m']:.1f} m, "
         f"{navigation.metrics['yaw_total_deg']:.1f} deg accumulated yaw, "
-        f"GNSS anchor={navigation.metrics['gnss_anchor_available']}",
+        f"heading-to-vehicle={navigation.metrics['heading_to_vehicle_yaw_deg']:.2f} deg",
         flush=True,
     )
 
-    calibrations: dict[str, RotationCalibration] = {}
+    initial_rotations: dict[str, np.ndarray] = {}
+    constraints_by_lidar: dict[str, list[PairConstraint]] = {}
     for lidar in lidars:
-        print(f"Calibrating {lidar.name}", flush=True)
+        print(f"Measuring motion constraints for {lidar.name}", flush=True)
         files, timestamps = scan_index(lidar.directory)
         pairs = select_pairs(
             timestamps,
@@ -1183,6 +1627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             options.seed,
             lidar.name,
         )
+        initial_rotations[lidar.name] = initial_rotation
         constraints = collect_constraints(
             lidar,
             files,
@@ -1191,18 +1636,65 @@ def main(argv: Sequence[str] | None = None) -> int:
             options.calibration_voxel_size,
             options.minimum_range,
             options.maximum_range,
+            np.zeros(3),
         )
-        calibration = calibrate_rotation(
+        constraints_by_lidar[lidar.name] = constraints
+
+    gnss_lever_arm = np.zeros(3)
+    lever_estimate = NavigationLeverArmEstimate(
+        value=gnss_lever_arm.copy(), reason="not solved"
+    )
+    calibrations: dict[str, RotationCalibration] = {}
+    for outer_iteration in range(options.lever_arm_outer_iterations):
+        calibrations = {
+            lidar.name: calibrate_rotation(
+                lidar,
+                initial_rotations[lidar.name],
+                constraints_by_lidar[lidar.name],
+                options.minimum_constraints,
+                options.rotation_update_bound_deg,
+                lidar.trusted_rotation
+                if options.inject_rotation_error_deg > 0.0
+                else None,
+                gnss_lever_arm,
+            )
+            for lidar in lidars
+        }
+        lever_estimate = estimate_gnss_lever_arm(
+            lidars,
+            calibrations,
+            gnss_lever_arm,
+            options.gnss_lever_arm_bound_m,
+        )
+        print(
+            f"GNSS lever-arm iteration {outer_iteration + 1}: "
+            f"value={lever_estimate.value.tolist()}, "
+            f"accepted={lever_estimate.accepted}; {lever_estimate.reason}",
+            flush=True,
+        )
+        if not lever_estimate.accepted:
+            break
+        change = float(np.linalg.norm(lever_estimate.value - gnss_lever_arm))
+        gnss_lever_arm = lever_estimate.value.copy()
+        if change < 1.0e-4:
+            break
+
+    calibrations = {
+        lidar.name: calibrate_rotation(
             lidar,
-            initial_rotation,
-            constraints,
+            initial_rotations[lidar.name],
+            constraints_by_lidar[lidar.name],
             options.minimum_constraints,
             options.rotation_update_bound_deg,
             lidar.trusted_rotation
             if options.inject_rotation_error_deg > 0.0
             else None,
+            gnss_lever_arm,
         )
-        calibrations[lidar.name] = calibration
+        for lidar in lidars
+    }
+    for lidar in lidars:
+        calibration = calibrations[lidar.name]
         error_text = (
             f", trusted error={calibration.trusted_final_error_deg:.3f} deg"
             if calibration.trusted_final_error_deg is not None
@@ -1218,13 +1710,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     reference_name = str(manifest["reference_lidar"])
     if reference_name not in calibrations:
         raise ValueError("selected LiDARs must include the manifest reference LiDAR")
-    all_accepted = all(calibration.accepted for calibration in calibrations.values())
+    all_accepted = lever_estimate.accepted and all(
+        calibration.accepted for calibration in calibrations.values()
+    )
     write_constraints(output_dir / "pair_constraints.csv", calibrations.values())
     write_trajectory(
         output_dir / "trajectory_navigation.csv",
         next(lidar for lidar in lidars if lidar.name == reference_name),
         calibrations[reference_name],
         navigation,
+        gnss_lever_arm,
     )
     if all_accepted:
         write_corrected_manifest(
@@ -1249,6 +1744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 lidars,
                 calibrations,
                 navigation,
+                gnss_lever_arm,
                 options.map_stride,
                 options.map_voxel_size,
                 options.minimum_range,
@@ -1261,7 +1757,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     summary = {
         "status": "success" if all_accepted else "non_converged",
-        "algorithm": "fixed_translation_navigation_aided_handeye_icp",
+        "algorithm": "fixed_translation_raw_imu_gnss_handeye_icp",
         "manifest": str(manifest_path),
         "dataset_root": str(dataset_root),
         "reference_lidar": reference_name,
@@ -1269,6 +1765,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         "injected_rotation_error_deg": options.inject_rotation_error_deg,
         "translation_optimized": False,
         "navigation": navigation.metrics,
+        "gnss_antenna_lever_arm": {
+            "accepted": lever_estimate.accepted,
+            "reason": lever_estimate.reason,
+            "vehicle_translation_m": gnss_lever_arm.tolist(),
+            "vertical_component_fixed": True,
+            "update_m": lever_estimate.update_m,
+            "hessian_eigenvalues": lever_estimate.hessian_eigenvalues,
+            "hessian_condition_number": lever_estimate.hessian_condition_number,
+            "heldout_initial_translation_rmse_m": (
+                lever_estimate.heldout_initial_translation_rmse_m
+            ),
+            "heldout_final_translation_rmse_m": (
+                lever_estimate.heldout_final_translation_rmse_m
+            ),
+        },
         "calibrations": {
             name: calibration_document(calibration)
             for name, calibration in calibrations.items()

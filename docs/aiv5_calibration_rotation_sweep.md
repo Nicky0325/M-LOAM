@@ -1,5 +1,10 @@
 # AIV5 calibrated-initialization rotation recovery sweep
 
+> Historical baseline only. Its derived pose reference is not an input to the
+> current calibration and is not independent calibration evidence. See the
+> [raw-IMU/GNSS result](aiv5_raw_imu_gnss_10deg_results.md) for the maintained
+> workflow.
+
 ## Experiment
 
 - Dataset: `/home/biaoding2/datasets/aiv5_sequence_extraction`
@@ -110,4 +115,3 @@ every sensor, freeze unobservable parameters, and repeat multiple random axes
 and seeds. A conservative operational policy is to reject online updates for a
 LiDAR unless it has sufficient eligible windows and both rotation and
 translation remain within bounded change from the trusted calibration.
-

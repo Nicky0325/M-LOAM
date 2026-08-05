@@ -6,40 +6,56 @@ through ROS topics. ROS is still initialized because the existing estimator
 uses ROS time, and `--ros-publish` can enable the existing visualization
 publishers.
 
+This file is the operational guide. The maintained problem formulation,
+coordinate conventions, optimization residuals, validation gates, and
+limitations are documented in
+[`docs/methodology/fixed_translation_planar_multi_lidar_calibration.md`](../../docs/methodology/fixed_translation_planar_multi_lidar_calibration.md).
+The corresponding equations and observability derivation are in the
+[`mathematical establishment`](../../docs/methodology/fixed_translation_planar_multi_lidar_calibration_math.md).
+The measured AIV5 result is kept separately in the
+[`raw-IMU/GNSS 10-degree report`](../../docs/aiv5_raw_imu_gnss_10deg_results.md).
+
 ## Planar-motion, known-translation calibration
 
 `planar_nav_rotation_calibrator.py` is the recommended prototype when the
 vehicle-frame LiDAR translations are trusted but the rotations can be wrong by
-roughly 10 degrees. It uses the smaller and better-conditioned problem that
-matches this rig instead of asking the original M-LOAM estimator to optimize
-all six extrinsic degrees of freedom:
+roughly 10 degrees. It uses only raw IMU and raw dual-antenna GNSS navigation,
+plus the LiDAR PCD scans:
 
-1. Interpolate the dense `vehicle_pose` DR trajectory and rigidly anchor it to
-   the local ENU trajectory from `ins.txt`.
-2. Select motion pairs with 0.8--6 m of displacement, prioritizing turns.
-3. Measure each LiDAR's relative motion with coarse-to-fine point-to-plane ICP.
-4. Solve `B_ij = X^-1 A_ij X` with a robust loss while keeping the translation
-   part of every `vehicle_T_lidar` exactly constant.
-5. Reject a sensor unless independent held-out motion pairs improve and the
-   3-DoF rotation Hessian is observable.
-6. Write a corrected offline manifest and a colored map built with the
-   GNSS-anchored trajectory.
+1. Convert raw GNSS fixes to ENU and interpolate position with measured ENU
+   velocity.
+2. Initialize gyro bias and fixed planar roll/pitch from stationary raw IMU.
+3. Integrate gyro-z and robustly anchor yaw to raw dual-antenna GNSS heading.
+4. Estimate the heading-baseline mounting yaw from straight GNSS velocity, or
+   accept its measured value from the command line.
+5. Select 0.8--6 m motion pairs and measure LiDAR motion with coarse-to-fine
+   point-to-plane ICP.
+6. Alternate rotation-only hand-eye solves with one shared planar GNSS-antenna
+   lever-arm solve. Every `vehicle_T_lidar` translation remains exactly fixed.
+7. Reject a result unless held-out motion improves and its Hessian is
+   observable, then write a fixed-extrinsic manifest and ENU colored map.
+
+The LiDAR-localizer pose stream, final INS text output, and wheel result are
+not accepted as inputs. This workflow also does not run the MLCC-style
+backend.
 
 Validate the 10-degree recovery basin deterministically on all enabled LiDARs:
 
 ```bash
 python3 estimator/offline/tools/planar_nav_rotation_calibrator.py \
   --manifest estimator/config/offline/aiv5_sequence.yaml \
-  --output-dir data/aiv5_planar_nav_10deg \
-  --inject-rotation-error-deg 10 --seed 42
+  --output-dir data/aiv5_raw_imu_gnss_10deg \
+  --inject-rotation-error-deg 10 --seed 42 \
+  --map-stride 10 --map-voxel-size 0.35
 ```
 
 For an actual coarse calibration, omit `--inject-rotation-error-deg`; the
 rotations resolved from the manifest become the starting values. The tool
 requires Python 3, NumPy, SciPy, PyYAML, and Open3D. It produces:
 
-- `summary.yaml`: excitation, GNSS alignment, held-out residuals,
-  observability, uncertainty, and (in injection mode) angular recovery error.
+- `summary.yaml`: raw-input quality, IMU/GNSS heading fit, GNSS lever arm,
+  excitation, held-out residuals, observability, uncertainty, and (in
+  injection mode) angular recovery error.
 - `pair_constraints.csv`: every ICP motion pair and its train/held-out status.
 - `corrected_manifest.yaml`: accepted rotations with the original translations
   copied unchanged and the joint 6-DoF backend disabled.
@@ -51,7 +67,7 @@ Run fixed-extrinsic M-LOAM with the accepted result:
 
 ```bash
 rosrun mloam mloam_offline_runner \
-  --manifest data/aiv5_planar_nav_10deg/corrected_manifest.yaml \
+  --manifest data/aiv5_raw_imu_gnss_10deg/corrected_manifest.yaml \
   --scenario precise
 ```
 
@@ -60,8 +76,11 @@ It is sufficient here because translation is known, the vehicle translates in
 the plane, and the route contains substantial yaw. A stationary sequence, a
 near-zero baseline, failed ICP overlap, or motion along only one unchanging
 direction should be treated as unobservable; the tool reports this instead of
-publishing an update. Absolute accuracy remains limited by the supplied DR and
-GNSS/INS trajectory and by scan motion distortion.
+publishing an update. Absolute accuracy remains limited by raw GNSS/IMU
+quality, GNSS/IMU mounting assumptions, timestamp alignment, and scan motion
+distortion. When the dual-antenna heading baseline's yaw relative to vehicle x
+is surveyed, pass it with `--gnss-heading-to-vehicle-yaw-deg`; otherwise the
+fallback assumes negligible sideslip on selected straight segments.
 
 ## Joint MLCC-style backend prototype
 
@@ -438,9 +457,9 @@ The process exit status is:
 - `2`: at least one scenario did not converge, but valid artifacts were kept.
 - `1`: configuration or execution failure.
 
-For an AIV5 session that also contains `vehicle_pose/*.prototxt`, generate ATE,
-RPE, aligned vehicle odometry, calibration, map, feature, synchronization, and
-runtime metrics with:
+The following evaluator is a legacy, optional odometry benchmark only. If an
+AIV5 session contains a LiDAR-localizer `vehicle_pose` stream, it can generate
+ATE and RPE against that derived reference:
 
 ```bash
 python3 estimator/offline/tools/evaluate_aiv5_session.py \
@@ -453,7 +472,9 @@ This writes `odometry_metrics.yaml` and
 `trajectory_vehicle_aligned.csv` in each scenario plus
 `session_metrics.yaml` and `session_report.md` at the session root. The
 evaluator applies a rigid SE(3), no-scale alignment and labels the supplied DR
-vehicle pose as a reference rather than surveyed ground truth.
+vehicle pose as a reference rather than surveyed ground truth. That reference
+is never an input to the raw-IMU/GNSS calibration workflow above and must not
+be used as independent calibration evidence.
 
 ## 6. Benchmark scenarios consistently
 

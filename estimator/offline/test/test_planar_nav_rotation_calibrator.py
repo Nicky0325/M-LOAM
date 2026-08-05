@@ -35,6 +35,115 @@ EVALUATOR_SPEC.loader.exec_module(evaluator)
 
 
 class PlanarNavigationCalibrationTest(unittest.TestCase):
+    def test_cli_uses_raw_imu_and_gnss_inputs(self) -> None:
+        options = calibrator.arguments(
+            ["--manifest", "manifest.yaml", "--output-dir", "output"]
+        )
+
+        self.assertTrue(hasattr(options, "imu_file"))
+        self.assertTrue(hasattr(options, "gnss_dir"))
+        self.assertFalse(hasattr(options, "pose_dir"))
+        self.assertFalse(hasattr(options, "ins_file"))
+        self.assertFalse(hasattr(options, "wheel_file"))
+
+    def test_shifts_antenna_motion_to_vehicle_origin(self) -> None:
+        antenna_motion = calibrator.make_transform(
+            Rotation.from_euler("z", 12.0, degrees=True).as_matrix(),
+            np.asarray([2.0, -0.4, 0.0]),
+        )
+        lever_arm = np.asarray([3.0, 0.8, 0.0])
+        shifted = calibrator.motion_at_vehicle_origin(antenna_motion, lever_arm)
+        expected_translation = (
+            antenna_motion[:3, 3]
+            + (np.eye(3) - antenna_motion[:3, :3]) @ lever_arm
+        )
+
+        np.testing.assert_allclose(shifted[:3, :3], antenna_motion[:3, :3])
+        np.testing.assert_allclose(shifted[:3, 3], expected_translation)
+
+    def test_estimates_shared_planar_gnss_lever_arm(self) -> None:
+        true_lever_arm = np.asarray([2.4, -0.7, 0.0])
+        lidar_definitions = []
+        calibrations = {}
+        translations = (
+            np.asarray([7.0, 1.2, 0.6]),
+            np.asarray([-7.1, -1.1, 0.6]),
+            np.asarray([0.2, 2.0, 1.5]),
+        )
+        rotations = (
+            Rotation.from_euler("xyz", [1.0, -2.0, 120.0], degrees=True).as_matrix(),
+            Rotation.from_euler("xyz", [-1.0, 1.0, -55.0], degrees=True).as_matrix(),
+            Rotation.from_euler("xyz", [0.5, -3.0, 10.0], degrees=True).as_matrix(),
+        )
+        vehicle_t_antenna = calibrator.make_transform(np.eye(3), true_lever_arm)
+        antenna_t_vehicle = calibrator.inverse(vehicle_t_antenna)
+        for lidar_index, (translation, rotation) in enumerate(
+            zip(translations, rotations)
+        ):
+            name = f"lidar_{lidar_index}"
+            definition = calibrator.LidarDefinition(
+                name=name,
+                directory=Path("."),
+                translation=translation,
+                trusted_rotation=rotation,
+                color=(1.0, 0.0, 0.0),
+            )
+            lidar_definitions.append(definition)
+            extrinsic = calibrator.make_transform(rotation, translation)
+            constraints = []
+            for pair_index in range(15):
+                vehicle_motion = calibrator.make_transform(
+                    Rotation.from_euler(
+                        "z", 2.0 + 0.7 * pair_index, degrees=True
+                    ).as_matrix(),
+                    np.asarray(
+                        [1.0 + 0.1 * pair_index, 0.2 * math.sin(pair_index), 0.0]
+                    ),
+                )
+                antenna_motion = (
+                    antenna_t_vehicle @ vehicle_motion @ vehicle_t_antenna
+                )
+                lidar_motion = (
+                    calibrator.inverse(extrinsic) @ vehicle_motion @ extrinsic
+                )
+                constraint = calibrator.PairConstraint(
+                    candidate=calibrator.PairCandidate(
+                        first=pair_index,
+                        second=pair_index + 10,
+                        vehicle_motion=antenna_motion,
+                        translation_m=float(
+                            np.linalg.norm(antenna_motion[:3, 3])
+                        ),
+                        rotation_deg=2.0 + 0.7 * pair_index,
+                    ),
+                    lidar_motion=lidar_motion,
+                    fitness=0.9,
+                    inlier_rmse_m=0.1,
+                    icp_translation_update_m=0.0,
+                    icp_rotation_update_deg=0.0,
+                    accepted=True,
+                    split="heldout" if pair_index % 5 == 0 else "train",
+                )
+                constraints.append(constraint)
+            calibrations[name] = calibrator.RotationCalibration(
+                name=name,
+                initial_rotation=rotation,
+                optimized_rotation=rotation,
+                fixed_translation=translation,
+                constraints=constraints,
+                accepted=True,
+            )
+
+        estimate = calibrator.estimate_gnss_lever_arm(
+            lidar_definitions,
+            calibrations,
+            np.zeros(3),
+            bound_m=10.0,
+        )
+
+        self.assertTrue(estimate.accepted, estimate.reason)
+        np.testing.assert_allclose(estimate.value, true_lever_arm, atol=1.0e-6)
+
     def test_recovers_ten_degrees_without_changing_translation(self) -> None:
         true_rotation = Rotation.from_euler(
             "xyz", [1.0, -2.0, 125.0], degrees=True
