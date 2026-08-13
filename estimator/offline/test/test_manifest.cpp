@@ -84,6 +84,7 @@ TEST(Manifest, ParsesAndValidatesJointBackend) {
 joint_backend:
   enabled: true
   mode: coarse_bootstrap
+  optimize_extrinsic_translation: false
   initial_voxel_size: 3.0
   minimum_voxel_size: 0.25
   minimum_keyframes: 4
@@ -96,6 +97,7 @@ joint_backend:
   EXPECT_TRUE(manifest.joint_backend.enabled);
   EXPECT_EQ(offline::JointBackendMode::kCoarseBootstrap,
             manifest.joint_backend.mode);
+  EXPECT_FALSE(manifest.joint_backend.optimize_extrinsic_translation);
   EXPECT_DOUBLE_EQ(3.0, manifest.joint_backend.initial_voxel_size);
   EXPECT_EQ(20u, manifest.joint_backend.bootstrap_frames);
   auto single_lidar = manifest;

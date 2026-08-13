@@ -123,6 +123,7 @@ enum class JointBackendMode {
 struct JointBackendConfig {
   bool enabled = false;
   JointBackendMode mode = JointBackendMode::kDisabled;
+  bool optimize_extrinsic_translation = true;
   double initial_voxel_size = 4.0;
   double minimum_voxel_size = 0.5;
   double downsample_size = 0.25;

@@ -239,6 +239,10 @@ void RunArtifacts::write(
            << manifest.joint_backend.minimum_voxel_size << '\n'
            << "  downsample_size: "
            << manifest.joint_backend.downsample_size << '\n'
+           << "  optimize_extrinsic_translation: "
+           << (manifest.joint_backend.optimize_extrinsic_translation ? "true"
+                                                                      : "false")
+           << '\n'
            << "  planarity_ratio: "
            << manifest.joint_backend.planarity_ratio << '\n'
            << "  minimum_points_per_voxel: "

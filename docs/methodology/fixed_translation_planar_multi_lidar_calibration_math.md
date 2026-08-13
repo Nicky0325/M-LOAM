@@ -1,13 +1,61 @@
-# Mathematical establishment of the raw-IMU/GNSS calibration
+# Mathematical establishment of rotation-prior-free calibration
 
 This document derives the model implemented by
 [planar_nav_rotation_calibrator.py](../../estimator/offline/tools/planar_nav_rotation_calibrator.py).
 It is the mathematical companion to the
 [algorithm methodology](fixed_translation_planar_multi_lidar_calibration.md).
 
-The derivation matches the implementation: LiDAR translations are constants,
-LiDAR rotations are estimated, the planar GNSS antenna lever arm is a shared
-nuisance variable, and navigation uses only raw IMU and raw dual-antenna GNSS.
+The primary derivation is for the rotation-prior-free path: LiDAR translations
+are constants, LiDAR rotations are estimated, the planar GNSS antenna lever
+arm is a shared nuisance variable, and navigation uses only raw IMU and raw
+dual-antenna GNSS. Signed motion axes reduce arbitrary $SO(3)$ initialization
+to one planar yaw per LiDAR; known translations then make those yaw variables
+observable. The older manifest-seeded path is retained only as a local-capture
+comparison and shares the final rotation-only hand-eye equations.
+
+## Mathematical overview
+
+For $N$ LiDARs, the prior-free global state is
+
+$$
+\Theta_0=
+[\beta_1,\ldots,\beta_N,g_x,g_y]^T,
+$$
+
+after one signed rotation axis has been recovered independently for every
+LiDAR. The optional local refinement state is
+
+$$
+\Theta_{local}=
+\{\delta_l\in\mathbb R^3\}_{l=1}^{N}
+\cup\{g_x,g_y\}.
+$$
+
+The supplied translations $t_l$ satisfy
+
+$$
+\frac{\partial t_l}{\partial\Theta_0}=0,
+\qquad
+\frac{\partial t_l}{\partial\Theta_{local}}=0.
+$$
+
+The mathematical chain used by the implementation is
+
+$$
+\text{raw IMU/GNSS}
+\rightarrow A^G_{ij}
+\rightarrow A^V_{ij}(g),
+\qquad
+\text{identity ICP}
+\rightarrow B^l_{ij},
+$$
+
+$$
+B^l_{ij}=X_l^{-1}A^V_{ij}X_l
+\rightarrow a_l=R_l^Tz_V
+\rightarrow R_l(\beta_l)
+\rightarrow (\beta_1,\ldots,\beta_N,g_x,g_y).
+$$
 
 ## 1. State, frames, and transform convention
 
@@ -57,7 +105,7 @@ R_l&t_l\\
 \end{bmatrix}.
 $$
 
-Every supplied $t_l\in\mathbb R^3$ is constant. The estimated state is
+Every supplied $t_l\in\mathbb R^3$ is constant. The local refinement state is
 
 $$
 \Theta=
@@ -414,7 +462,10 @@ n_m^T(Bp_m-q_m)
 \right]^2.
 $$
 
-The coarse hand-eye prediction initializes ICP. The final measurement
+In manifest mode, a hand-eye prediction from the input rotation initializes
+ICP. In prior-free mode, every registration starts from identity; no
+extrinsic rotation or translation is used to form correspondences. The final
+measurement
 
 $$
 \hat B^l_{ij}
@@ -457,11 +508,145 @@ The second equation is the central fixed-translation constraint. Both the
 known LiDAR lever $t_l$ and unknown antenna lever $g$ affect turn-induced
 translation, but only $R_l,g_x,g_y$ may change.
 
-## 6. Robust alternating optimization
+## 6. Rotation-prior-free initialization
 
-### 6.1 Rotation-only LiDAR block
+### 6.1 Rotation-angle invariant and signed axes
 
-Rotation uses a right perturbation of the coarse input:
+Let $z_V$ be the unit planar rotation axis expressed in the vehicle frame. For
+ideal planar motion,
+
+$$
+Q_{ij}=\operatorname{Exp}(\theta_{ij}[z_V]_\times).
+$$
+
+The LiDAR-frame rotation is
+
+$$
+S^l_{ij}=R_l^TQ_{ij}R_l
+=\operatorname{Exp}
+\left(\theta_{ij}[R_l^Tz_V]_\times\right).
+$$
+
+Conjugation preserves eigenvalues and hence rotation magnitude:
+
+$$
+\left\|\operatorname{Log}(S^l_{ij})\right\|=|\theta_{ij}|.
+$$
+
+This identity lets raw navigation reject an identity-seeded ICP result whose
+angle is implausible without knowing $R_l$. For a nonzero accepted turn, raw
+navigation also supplies the sign, so one signed axis sample is
+
+$$
+a^l_{ij}
+=
+\operatorname{sign}(\theta_{ij})
+\frac{\operatorname{Log}(S^l_{ij})}
+{\left\|\operatorname{Log}(S^l_{ij})\right\|}
+\simeq R_l^Tz_V.
+$$
+
+The implementation uses a one-sample RANSAC over these axes, weights samples
+by turn magnitude and ICP quality, rejects samples farther than four degrees,
+and averages the inliers on the unit sphere. Navigation motions are treated
+the same way to obtain the slightly tilted planar axis $z_V$ rather than
+hard-coding $e_z$.
+
+### 6.2 Axis alignment leaves one yaw
+
+Let $a_l$ be the robust LiDAR-frame axis and let $R_{0l}$ be the minimum-angle
+rotation satisfying
+
+$$
+R_{0l}a_l=z_V.
+$$
+
+Every rotation consistent with the recovered axes is then
+
+$$
+R_l(\beta_l)
+=\operatorname{Exp}(\beta_l[z_V]_\times)R_{0l}.
+$$
+
+Thus arbitrary $SO(3)$ initialization has become one scalar yaw per LiDAR.
+
+### 6.3 Fixed-translation Procrustes yaw
+
+For a chosen planar antenna lever $g$, define the vehicle-frame translation
+predicted by navigation and the known LiDAR lever:
+
+$$
+c^l_{ij}(g)
+=d_{ij}+(I-Q_{ij})g+(Q_{ij}-I)t_l.
+$$
+
+The translational hand-eye equation requires
+
+$$
+c^l_{ij}(g)\simeq R_l(\beta_l)b^l_{ij}.
+$$
+
+Choose orthonormal vectors $u,v$ perpendicular to $z_V$ and project
+$R_{0l}b^l_{ij}$ and $c^l_{ij}$ into that plane. For projected source
+$s=[s_x,s_y]^T$, target $c=[c_x,c_y]^T$, and robust weight $w$, the global
+two-dimensional Procrustes solution is
+
+$$
+\beta_l
+=\operatorname{atan2}
+\left(
+\sum w(c_y s_x-c_x s_y),
+\sum w(c_x s_x+c_y s_y)
+\right).
+$$
+
+The implementation uses
+
+$$
+w_{lij}=
+\frac{\sqrt{\max(0.05,f_{lij})}}
+{\max(0.10,\sigma_{lij})},
+$$
+
+where $f_{lij}$ is ICP fitness and $\sigma_{lij}$ is ICP inlier RMSE.
+
+This is a global solution on the circle for fixed $g$, not a small-angle
+perturbation about a manifest rotation.
+
+### 6.4 Joint multi-start yaw and antenna-lever solve
+
+The prior-free initializer finally solves
+
+$$
+\Theta_0=[\beta_1,\ldots,\beta_N,g_x,g_y]^T
+$$
+
+with the robust translational objective
+
+$$
+\Theta_0^*
+=\arg\min_{\Theta_0}
+\sum_l\sum_{(i,j)\in\mathcal T_l}
+\rho_C\left(
+w_{lij}
+\left[
+R_l(\beta_l)b^l_{ij}-c^l_{ij}(g)
+\right]
+\right).
+$$
+
+Here $\rho_C$ is applied componentwise.
+
+The implementation initializes each $\beta_l$ with the Procrustes expression
+and tries planar lever seeds at zero, at every known LiDAR translation, and at
+their median. LiDAR manifest rotations do not enter this state, its starts, or
+its residual. The joint Hessian is $(N+2)\times(N+2)$.
+
+## 7. Robust local alternating optimization
+
+### 7.1 Rotation-only LiDAR block
+
+Rotation uses a right perturbation of the selected initializer:
 
 $$
 R_l(\delta_l)=
@@ -534,7 +719,7 @@ $$
 subject to the configured component bounds. $\mathcal T_l$ is the training
 set; every fifth accepted constraint is held out.
 
-### 6.2 Shared planar antenna-lever block
+### 7.2 Shared planar antenna-lever block
 
 Conditional on all $R_l$, the lever solve uses weighted translation only:
 
@@ -571,12 +756,12 @@ The algorithm alternates:
 3. stop when the lever update is below $10^{-4}$ m or the iteration limit.
 
 This is block-coordinate robust least squares, not a joint navigation factor
-graph. Each rotation block is re-solved relative to its original coarse
-rotation at every outer iteration.
+graph. Each rotation block is re-solved relative to the manifest-seeded or
+prior-free initializer selected at the start of the run.
 
-## 7. Planar observability
+## 8. Planar observability
 
-### 7.1 Ambiguity of rotation alone
+### 8.1 Ambiguity of rotation alone
 
 Under ideal planar motion,
 
@@ -607,7 +792,7 @@ $$
 The rotation equation identifies the vehicle z-axis direction in the LiDAR
 frame, but not rotation about that axis.
 
-### 7.2 Fixed translations remove the remaining ambiguity
+### 8.2 Fixed translations remove the remaining ambiguity
 
 The predicted LiDAR translation contains
 
@@ -672,7 +857,7 @@ $$
 The rotation term supplies two strong directions under yaw motion. The
 translation term and changing $u_{lq}$ supply the remaining information.
 
-### 7.3 Antenna height is unobservable
+### 8.3 Antenna height is unobservable
 
 For planar $Q_{ij}=R_z(\Delta\psi)$,
 
@@ -692,7 +877,7 @@ $$
 
 Turning pairs make the planar lever observable; straight-only pairs do not.
 
-### 7.4 Degenerate data
+### 8.4 Degenerate data
 
 The system becomes weak or unobservable when:
 
@@ -703,7 +888,7 @@ The system becomes weak or unobservable when:
 - turns do not excite GNSS and LiDAR lever effects; or
 - course-based mounting yaw is invalid and no surveyed yaw is supplied.
 
-## 8. Hessian, covariance, and acceptance
+## 9. Hessian, covariance, and acceptance
 
 For each LiDAR, the solver returns robustified residual Jacobian $J_l$. The
 reported Gauss-Newton information approximation is
@@ -732,11 +917,33 @@ $$
 H_g=J_g^TJ_g\in\mathbb R^{2\times2}.
 $$
 
-Both solves require a positive minimum eigenvalue and condition number below
-$10^6$. Solver success and the configured update bound are also required.
-Each LiDAR must improve held-out translation RMSE and must not worsen held-out
-rotation RMSE by more than 5%; the shared lever solve must not materially
-regress its held-out translation RMSE. For held-out set
+The local rotation and lever solves require a positive minimum eigenvalue and
+condition number below $10^6$. Solver success and the configured update bound
+are also required. On the manifest-seeded path, each LiDAR must improve
+held-out translation RMSE and must not worsen held-out rotation RMSE by more
+than 5%; the shared lever solve must not materially regress held-out
+translation RMSE.
+
+For prior-free initialization, let $J_0$ be the Jacobian of the joint state
+$\Theta_0$. Its information matrix
+
+$$
+H_0=J_0^TJ_0\in\mathbb R^{(N+2)\times(N+2)}
+$$
+
+must have minimum eigenvalue above $10^{-9}$ and condition number below
+$10^8$. Every LiDAR also needs a stable signed axis and held-out translation
+and rotation RMSE below 0.75 m and 2.5 degrees. A subsequent local
+three-dimensional proposal is selected only if it reduces
+
+$$
+s_l=
+\frac{\operatorname{RMSE}_{t,l}}{0.20\ \mathrm m}
++
+\frac{\operatorname{RMSE}_{R,l}}{0.20^\circ}.
+$$
+
+Otherwise the valid global initializer is retained. For held-out set
 $\mathcal H_l$,
 
 $$
@@ -762,7 +969,33 @@ $$
 }.
 $$
 
-## 9. Map and relative extrinsics
+### 9.1 Optional rotation-only MLCC gate
+
+The MLCC-style backend partitions transformed points into mixed-LiDAR planar
+voxels. For voxel $v$, with point covariance $C_v$, its plane objective is the
+smallest eigenvalue
+
+$$
+E_v=\lambda_{\min}(C_v),
+\qquad
+E=\sum_v E_v.
+$$
+
+When `optimize_extrinsic_translation: false`, Ceres receives every extrinsic
+translation parameter block as constant. Only pose and extrinsic quaternion
+blocks may update. The extrinsic observability test consequently uses the
+rotation block
+
+$$
+H^{MLCC}_{R_l}\in\mathbb R^{3\times3}
+$$
+
+rather than the rank-deficient six-dimensional block containing three fixed
+translation directions. Even a converged proposal is applied only when the
+training and held-out plane objectives satisfy the configured acceptance
+gates; rejection leaves both rotation and translation unchanged.
+
+## 10. Map and relative extrinsics
 
 For point $p^{L_l}$ in LiDAR $l$, the accepted ENU map point is
 
@@ -793,7 +1026,7 @@ T_{VL_r}^{-1}T_{VL_l}
 X_r^{-1}X_l.
 $$
 
-## 10. Gauge and scope summary
+## 11. Gauge and scope summary
 
 | Quantity | How it is fixed or estimated |
 |---|---|
@@ -803,17 +1036,18 @@ $$
 | High-rate yaw | bias-corrected raw gyro-z |
 | Vehicle origin | raw antenna position minus $R_{WV}g$ |
 | LiDAR translation $t_l$ | supplied constant; never optimized |
-| LiDAR rotation $R_l$ | robust fixed-translation hand-eye solve |
+| LiDAR rotation $R_l$ | signed-axis plus global yaw, then guarded local refinement |
 | GNSS lever $g_x,g_y$ | shared robust translation solve |
 | GNSS lever $g_z$ | fixed to zero; planar-unobservable |
 
 The map is globally referenced because raw GNSS fixes position and
 dual-antenna heading fixes yaw. It is not a GNSS-denied SLAM proof: without
 GNSS, global consistency requires loop closure and pose-graph or factor-graph
-optimization. The result does not use the MLCC-style backend, a wheel model, a
-downstream navigation solution, or a LiDAR-derived vehicle pose.
+optimization. The global initializer does not use the MLCC-style backend, a
+wheel model, a downstream navigation solution, or a LiDAR-derived vehicle
+pose. MLCC is available only as a separately gated local refinement.
 
-## 11. Code correspondence
+## 12. Code correspondence
 
 | Mathematical block | Implementation function |
 |---|---|
@@ -821,7 +1055,11 @@ downstream navigation solution, or a LiDAR-derived vehicle pose.
 | Stationary initialization, yaw fusion, Hermite trajectory | load_raw_navigation |
 | $A^V=T(g)A^G T(-g)$ | motion_at_vehicle_origin |
 | Motion-pair construction | select_pairs |
-| Point-to-plane $B^l_{ij}$ measurement | multiscale_icp, collect_constraints |
+| Prior-free identity ICP | independent_motion_icp, collect_prior_free_constraints |
+| Signed axes | robust_planar_axes, minimal_rotation_between |
+| Procrustes and joint yaw/lever solve | planar_yaw_procrustes, estimate_prior_free_initialization |
+| Manifest-seeded point-to-plane motion | multiscale_icp, collect_constraints |
 | Rotation residual and solve | handeye_residual, calibrate_rotation |
 | Shared planar $g$ solve | estimate_gnss_lever_arm |
+| Rotation-only MLCC lock and Hessian | joint_backend.cpp: solveStage, fillHessianDiagnostics |
 | ENU point transformation | NavigationTrajectory.poses, build_maps |
