@@ -14,6 +14,7 @@ dataset-specific evidence and command-oriented run guides.
 
 ## Evaluation reports
 
+- [AIV5 rotation-prior-free feasibility study](aiv5_rotation_prior_free_feasibility_report.md): observability analysis, no-prior initialization strategy, raw IMU/GNSS/wheel fusion assessment, dataset excitation, and proposed validation protocol.
 - [AIV5 raw-IMU/GNSS 10-degree recovery](aiv5_raw_imu_gnss_10deg_results.md): current successful six-LiDAR calibration and ENU mapping experiment.
 - [Superseded AIV5 navigation-aided report](aiv5_planar_nav_10deg_results.md): withdrawal notice for the earlier leakage-prone experiment.
 - [AIV5 legacy calibration rotation sweep](aiv5_calibration_rotation_sweep.md): behavior of the original calibration path under injected rotation errors.

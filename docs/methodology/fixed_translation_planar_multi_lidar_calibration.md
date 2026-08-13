@@ -1,13 +1,9 @@
 # Raw-IMU/GNSS fixed-translation multi-LiDAR rotation calibration
 
-This is the canonical description of the repository's offline calibration
-prototype for a planar vehicle rig. Dataset-specific measurements are kept in
-the [AIV5 raw-sensor report](../aiv5_raw_imu_gnss_10deg_results.md), while
-commands and artifact handling are in the
-[offline operation guide](../../estimator/offline/README.md).
+This is the canonical description of the repository's offline calibration prototype for a planar vehicle rig. Dataset-specific measurements are kept in
+the [AIV5 raw-sensor report](../aiv5_raw_imu_gnss_10deg_results.md), while commands and artifact handling are in the [offline operation guide](../../estimator/offline/README.md).
 
-The complete frame-by-frame derivation, expanded hand-eye equations,
-Jacobians, and planar observability argument are in the
+The complete frame-by-frame derivation, expanded hand-eye equations, Jacobians, and planar observability argument are in the
 [mathematical establishment](fixed_translation_planar_multi_lidar_calibration_math.md).
 
 Implementation:
@@ -15,44 +11,28 @@ Implementation:
 
 ## 1. Design decision and data boundary
 
-The target rig has precise LiDAR translations in the vehicle frame, but its
-LiDAR rotations may initially be wrong by about 10 degrees. The vehicle motion
-is predominantly planar. The estimator therefore solves only the three
-rotational degrees of freedom of every `vehicle_T_lidar` transform and copies
+The target rig has precise LiDAR translations in the vehicle frame, but its LiDAR rotations may initially be wrong by about 10 degrees. The vehicle motion
+is predominantly planar. The estimator therefore solves only the three rotational degrees of freedom of every `vehicle_T_lidar` transform and copies
 each supplied translation exactly.
 
 The navigation trajectory is constructed only from:
 
 - raw accelerometer and gyroscope samples in `imu.txt`; and
-- raw GNSS records in `gnss/*.prototxt`: WGS84 position, ENU velocity, and
-  dual-antenna RTK heading.
+- raw GNSS records in `gnss/*.prototxt`: WGS84 position, ENU velocity, and dual-antenna RTK heading.
 
-The implementation intentionally does not read the LiDAR-localizer vehicle
-pose stream, the final INS text result, or the incomplete wheel result. It has
-no command-line argument for any of those sources. This avoids using a pose
-whose generation already depends on precise LiDAR calibration.
+The implementation intentionally does not read the LiDAR-localizer vehicle pose stream, the final INS text result, or the incomplete wheel result. It has
+no command-line argument for any of those sources. This avoids using a pose whose generation already depends on precise LiDAR calibration.
 
-This is not the MLCC-style backend. It is a calibration stage that writes a
-fixed-extrinsic manifest with the joint backend disabled.
+This is not the MLCC-style backend. It is a calibration stage that writes a fixed-extrinsic manifest with the joint backend disabled.
 
 ## 2. Why the constrained problem is observable
 
-An unconstrained six-degree-of-freedom extrinsic solve is poorly conditioned
-under nearly planar motion. Weak roll and pitch excitation allows rotation and
-translation to compensate for one another. Fixing the measured translations
-removes that ambiguity.
+An unconstrained six-degree-of-freedom extrinsic solve is poorly conditioned under nearly planar motion. Weak roll and pitch excitation allows rotation and translation to compensate for one another. Fixing the measured translations removes that ambiguity.
 
-The rig also has long, diverse LiDAR lever arms. During a turn, an incorrect
-rotation predicts the wrong LiDAR-frame translation even when the vehicle
-origin follows the correct planar trajectory. The known lever arms therefore
-make rotation strongly observable from the translational part of the hand-eye
-equation. ICP rotation and scene geometry add information about the other
-axes.
+The rig also has long, diverse LiDAR lever arms. During a turn, an incorrect rotation predicts the wrong LiDAR-frame translation even when the vehicle
+origin follows the correct planar trajectory. The known lever arms therefore make rotation strongly observable from the translational part of the hand-eye equation. ICP rotation and scene geometry add information about the other axes.
 
-The current AIV5 sequence contains about 153 m of travel and 116 degrees of
-accumulated yaw, including motion in more than one direction. That is enough
-for this fixed-translation problem. It is not evidence that arbitrary planar
-data can identify a full six-degree-of-freedom extrinsic.
+The current AIV5 sequence contains about 153 m of travel and 116 degrees of accumulated yaw, including motion in more than one direction. That is enough for this fixed-translation problem. It is not evidence that arbitrary planar data can identify a full six-degree-of-freedom extrinsic.
 
 ## 3. Frames and transform convention
 
@@ -98,105 +78,76 @@ flowchart LR
     V --> Q[Raw-GNSS-anchored colored map]
 ```
 
-All LiDARs share the same independently measured rig motion. Direct scan
-overlap between every pair of LiDARs is not required. Relative LiDAR-to-LiDAR
+All LiDARs share the same independently measured rig motion. Direct scan overlap between every pair of LiDARs is not required. Relative LiDAR-to-LiDAR
 extrinsics are derived after the vehicle-frame rotations have been estimated.
 
 ## 5. Raw navigation construction
 
 ### 5.1 GNSS position
 
-Usable raw GNSS records are sorted independently by their position and heading
-timestamps. Latitude, longitude, and altitude are converted through WGS84 ECEF
-to a local ENU frame about the first valid fix. Position is interpolated to the
-IMU timestamps with a cubic Hermite spline whose endpoint derivatives are the
-measured ENU velocities. This preserves the globally referenced GNSS path
-without importing a downstream navigation solution.
+Usable raw GNSS records are sorted independently by their position and heading timestamps. Latitude, longitude, and altitude are converted through WGS84 ECEF to a local ENU frame about the first valid fix. Position is interpolated to the IMU timestamps with a cubic Hermite spline whose endpoint derivatives are the measured ENU velocities. This preserves the globally referenced GNSS path without importing a downstream navigation solution.
 
-The run is rejected if there are fewer than 20 usable position records or a
-position gap exceeds one second.
+The run is rejected if there are fewer than 20 usable position records or a position gap exceeds one second.
 
 ### 5.2 Stationary IMU initialization
 
-Samples are considered stationary when interpolated GNSS speed is below
-0.10 m/s and accelerometer magnitude is between 8.0 and 11.5 m/s^2. At least
-50 such samples are required. Their median gyroscope value initializes the
-constant gyro bias, and median gravity supplies one fixed roll/pitch attitude
-for this planar model.
+Samples are considered stationary when interpolated GNSS speed is below 0.10 m/s and accelerometer magnitude is between 8.0 and 11.5 m/s^2. At least 50 such samples are required. Their median gyroscope value initializes the constant gyro bias, and median gravity supplies one fixed roll/pitch attitude for this planar model.
 
-The prototype assumes the IMU axes and vehicle axes have compatible
-roll/pitch conventions. A known IMU-to-vehicle rotation should replace this
+The prototype assumes the IMU axes and vehicle axes have compatible roll/pitch conventions. A known IMU-to-vehicle rotation should replace this
 assumption on a rig where they are not aligned.
 
 ### 5.3 High-rate yaw fusion
 
-Bias-corrected gyro-z is trapezoidally integrated at the IMU rate. A robust
-two-parameter fit estimates a constant heading offset and a residual linear
+Bias-corrected gyro-z is trapezoidally integrated at the IMU rate. A robust two-parameter fit estimates a constant heading offset and a residual linear
 gyro drift against the raw dual-antenna GNSS headings:
 
 ```text
 yaw_H(t) = integral(gyro_z - stationary_bias) + c0 + c1 * (t - t0).
 ```
 
-The fit uses a Cauchy loss and honors the GNSS heading timestamp separately
-from the position timestamp. GNSS heading is therefore an absolute,
+The fit uses a Cauchy loss and honors the GNSS heading timestamp separately from the position timestamp. GNSS heading is therefore an absolute,
 low-frequency anchor while gyro-z supplies smooth high-rate relative yaw.
 
 ### 5.4 Heading-frame mounting yaw
 
-Dual-antenna heading is not necessarily the vehicle x direction. The best
-input is a measured constant mounting yaw supplied with
+Dual-antenna heading is not necessarily the vehicle x direction. The best input is a measured constant mounting yaw supplied with
 `--gnss-heading-to-vehicle-yaw-deg`.
 
-When that value is unavailable, the prototype estimates it from raw GNSS
-velocity during samples with speed at least 2 m/s and absolute yaw rate no
+When that value is unavailable, the prototype estimates it from raw GNSS velocity during samples with speed at least 2 m/s and absolute yaw rate no
 more than 0.02 rad/s:
 
 ```text
 heading_to_vehicle_yaw = circular_mean(course_ENU - dual_antenna_heading).
 ```
 
-This fallback does not consume wheel speed, steering angle, or a vehicle
-model, but it does make one weak nonholonomic assumption: during selected
-straight segments, sideslip is small enough that GNSS course is the vehicle x
-direction. At least 20 samples are required and the robust alignment p95 must
-be no more than 5 degrees. If even that assumption is disallowed, the mounting
-yaw must be measured; it is not observable from raw heading labels alone.
+This fallback does not consume wheel speed, steering angle, or a vehicle model, but it does make one weak nonholonomic assumption: during selected
+straight segments, sideslip is small enough that GNSS course is the vehicle x direction. At least 20 samples are required and the robust alignment p95 must be no more than 5 degrees. If even that assumption is disallowed, the mounting yaw must be measured; it is not observable from raw heading labels alone.
 
 ### 5.5 Unknown GNSS antenna lever arm
 
-GNSS positions describe an antenna, not the vehicle origin. Treating them as
-the vehicle origin creates a turn-dependent translation error. The prototype
+GNSS positions describe an antenna, not the vehicle origin. Treating them as the vehicle origin creates a turn-dependent translation error. The prototype
 therefore estimates one shared planar antenna lever arm
 
 ```text
 g = [g_x, g_y, 0].
 ```
 
-If `A_G` is antenna-origin motion expressed with vehicle-aligned axes, the
-corresponding vehicle-origin motion is
+If `A_G` is antenna-origin motion expressed with vehicle-aligned axes, the corresponding vehicle-origin motion is
 
 ```text
 A_V = T(g) * A_G * inverse(T(g)).
 ```
 
-The vertical component is fixed because planar motion cannot reliably
-identify it. This nuisance parameter changes the navigation reference point;
+The vertical component is fixed because planar motion cannot reliably identify it. This nuisance parameter changes the navigation reference point;
 it does not change any supplied LiDAR translation.
 
 ## 6. Motion-pair selection and ICP
 
-For each LiDAR, candidate scans must lie inside raw-navigation coverage. With
-the defaults, the tool examines every fifth start scan, pairs it with a scan 15
-frames later, retains 0.8--6.0 m motions, ranks them by
-`rotation_deg + 0.2 * translation_m`, and keeps the best 40. This favors turns
-while excluding stationary and excessively long registrations.
+For each LiDAR, candidate scans must lie inside raw-navigation coverage. With the defaults, the tool examines every fifth start scan, pairs it with a scan 15
+frames later, retains 0.8--6.0 m motions, ranks them by `rotation_deg + 0.2 * translation_m`, and keeps the best 40. This favors turns while excluding stationary and excessively long registrations.
 
-The coarse extrinsic and raw navigation predict the initial LiDAR motion. The
-scan at `j` is registered into the scan at `i` with three-stage Open3D
-point-to-plane ICP. Points outside 2--80 m are removed, clouds are voxelized at
-0.45 m, and normals are estimated locally. Correspondence distances are four,
-two, and one voxel widths.
+The coarse extrinsic and raw navigation predict the initial LiDAR motion. The scan at `j` is registered into the scan at `i` with three-stage Open3D
+point-to-plane ICP. Points outside 2--80 m are removed, clouds are voxelized at 0.45 m, and normals are estimated locally. Correspondence distances are four, two, and one voxel widths.
 
 A measured motion is retained only if:
 
@@ -207,16 +158,13 @@ A measured motion is retained only if:
 | Translation correction from prediction | at most 2.5 m |
 | Rotation correction from prediction | at most 10 degrees |
 
-ICP is currently measured once from the coarse prediction; it is not rerun
-after every calibration update.
+ICP is currently measured once from the coarse prediction; it is not rerun after every calibration update.
 
 ## 7. Alternating calibration solve
 
-Only each `R_l` and the shared planar GNSS lever arm `g` are variables. Every
-LiDAR translation `t_l` remains a constant copied from the manifest.
+Only each `R_l` and the shared planar GNSS lever arm `g` are variables. Every LiDAR translation `t_l` remains a constant copied from the manifest.
 
-For a fixed `g`, LiDAR rotation is represented as a bounded right perturbation
-of the coarse rotation:
+For a fixed `g`, LiDAR rotation is represented as a bounded right perturbation of the coarse rotation:
 
 ```text
 R_l(delta) = R_l_initial * Exp(delta)
@@ -231,14 +179,9 @@ r = w * [2 * Log(transpose(R_B) * R_B_hat), t_B_hat - t_B]
 w = sqrt(max(0.05, ICP_fitness)) / max(0.10, ICP_inlier_RMSE).
 ```
 
-SciPy least squares uses a Cauchy loss and a default 15-degree component bound.
-With all LiDAR rotations fixed, a second robust two-parameter solve updates
-`g_x` and `g_y` from the hand-eye translation residuals across all LiDARs.
-Rotation and lever-arm solves alternate up to 15 iterations or until the lever
-change is below 0.1 mm.
+SciPy least squares uses a Cauchy loss and a default 15-degree component bound. With all LiDAR rotations fixed, a second robust two-parameter solve updates `g_x` and `g_y` from the hand-eye translation residuals across all LiDARs. Rotation and lever-arm solves alternate up to 15 iterations or until the lever change is below 0.1 mm.
 
-The reported antenna lever arm is a nuisance estimate that makes raw GNSS
-antenna motion consistent with all fixed LiDAR lever arms. It should not be
+The reported antenna lever arm is a nuisance estimate that makes raw GNSS antenna motion consistent with all fixed LiDAR lever arms. It should not be
 treated as a surveyed antenna measurement without independent validation.
 
 ## 8. Held-out validation and observability
