@@ -46,6 +46,35 @@ class PlanarNavigationCalibrationTest(unittest.TestCase):
         self.assertFalse(hasattr(options, "ins_file"))
         self.assertFalse(hasattr(options, "wheel_file"))
 
+    def test_prior_free_loader_accepts_translation_only_manifest(self) -> None:
+        document = {
+            "dataset_root": "/data",
+            "lidars": [
+                {
+                    "name": "translation_only",
+                    "directory": "lidar",
+                    "vehicle_T_lidar": {"translation": [7.0, 1.0, 0.5]},
+                }
+            ],
+        }
+
+        lidars = calibrator.load_lidars(
+            Path("/tmp/manifest.yaml"),
+            document,
+            include=None,
+            load_manifest_rotations=False,
+        )
+
+        np.testing.assert_array_equal(lidars[0].translation, [7.0, 1.0, 0.5])
+        self.assertIsNone(lidars[0].trusted_rotation)
+        with self.assertRaisesRegex(ValueError, "no manifest rotation"):
+            calibrator.load_lidars(
+                Path("/tmp/manifest.yaml"),
+                document,
+                include=None,
+                load_manifest_rotations=True,
+            )
+
     def test_shifts_antenna_motion_to_vehicle_origin(self) -> None:
         antenna_motion = calibrator.make_transform(
             Rotation.from_euler("z", 12.0, degrees=True).as_matrix(),
@@ -212,6 +241,110 @@ class PlanarNavigationCalibrationTest(unittest.TestCase):
             result.heldout_initial["translation_rmse_m"],
         )
 
+    def test_recovers_arbitrary_rotations_without_using_manifest_rotations(self) -> None:
+        true_lever_arm = np.asarray([3.2, -0.8, 0.0])
+        translations = (
+            np.asarray([7.1, 1.2, 0.6]),
+            np.asarray([7.2, -1.1, 0.6]),
+            np.asarray([-7.2, -1.2, 0.6]),
+            np.asarray([-7.3, 1.1, 0.6]),
+        )
+        true_rotations = (
+            Rotation.from_euler("xyz", [27.0, -41.0, 132.0], degrees=True).as_matrix(),
+            Rotation.from_euler("xyz", [-65.0, 18.0, 37.0], degrees=True).as_matrix(),
+            Rotation.from_euler("xyz", [91.0, -22.0, -54.0], degrees=True).as_matrix(),
+            Rotation.from_euler("xyz", [-38.0, 73.0, -149.0], degrees=True).as_matrix(),
+        )
+        bogus_manifest_rotations = (
+            Rotation.from_euler("xyz", [-5.0, 81.0, 11.0], degrees=True).as_matrix(),
+            Rotation.from_euler("xyz", [55.0, -44.0, 170.0], degrees=True).as_matrix(),
+            Rotation.from_euler("xyz", [-89.0, 3.0, 42.0], degrees=True).as_matrix(),
+            Rotation.from_euler("xyz", [12.0, 33.0, -7.0], degrees=True).as_matrix(),
+        )
+        vehicle_t_antenna = calibrator.make_transform(np.eye(3), true_lever_arm)
+        antenna_t_vehicle = calibrator.inverse(vehicle_t_antenna)
+        lidars = []
+        constraints_by_lidar = {}
+        for lidar_index, (translation, true_rotation, bogus_rotation) in enumerate(
+            zip(translations, true_rotations, bogus_manifest_rotations)
+        ):
+            name = f"lidar_{lidar_index}"
+            lidar = calibrator.LidarDefinition(
+                name=name,
+                directory=Path("."),
+                translation=translation,
+                trusted_rotation=bogus_rotation,
+                color=(1.0, 0.0, 0.0),
+            )
+            lidars.append(lidar)
+            extrinsic = calibrator.make_transform(true_rotation, translation)
+            constraints = []
+            for motion_index in range(25):
+                yaw_deg = 2.0 + 0.45 * motion_index
+                vehicle_motion = calibrator.make_transform(
+                    Rotation.from_euler("z", yaw_deg, degrees=True).as_matrix(),
+                    np.asarray(
+                        [
+                            1.0 + 0.08 * motion_index,
+                            0.35 * math.sin(0.4 * motion_index),
+                            0.0,
+                        ]
+                    ),
+                )
+                antenna_motion = (
+                    antenna_t_vehicle @ vehicle_motion @ vehicle_t_antenna
+                )
+                lidar_motion = (
+                    calibrator.inverse(extrinsic) @ vehicle_motion @ extrinsic
+                )
+                constraints.append(
+                    calibrator.PairConstraint(
+                        candidate=calibrator.PairCandidate(
+                            first=motion_index,
+                            second=motion_index + 10,
+                            vehicle_motion=antenna_motion,
+                            translation_m=float(
+                                np.linalg.norm(antenna_motion[:3, 3])
+                            ),
+                            rotation_deg=yaw_deg,
+                        ),
+                        lidar_motion=lidar_motion,
+                        fitness=0.9,
+                        inlier_rmse_m=0.1,
+                        icp_translation_update_m=float(
+                            np.linalg.norm(lidar_motion[:3, 3])
+                        ),
+                        icp_rotation_update_deg=yaw_deg,
+                        accepted=True,
+                        registration_mode="synthetic_identity_seeded",
+                        motion_angle_error_deg=0.0,
+                    )
+                )
+            constraints_by_lidar[name] = constraints
+
+        result = calibrator.estimate_prior_free_initialization(
+            lidars,
+            constraints_by_lidar,
+            minimum_constraints=12,
+            lever_arm_bound_m=10.0,
+            axis_inlier_deg=4.0,
+        )
+
+        self.assertTrue(result.accepted, result.reason)
+        np.testing.assert_allclose(result.gnss_lever_arm, true_lever_arm, atol=1.0e-5)
+        for lidar, true_rotation, bogus_rotation in zip(
+            lidars, true_rotations, bogus_manifest_rotations
+        ):
+            initialized = result.lidars[lidar.name].rotation
+            self.assertLess(
+                calibrator.angular_distance_degrees(true_rotation, initialized),
+                1.0e-4,
+            )
+            self.assertGreater(
+                calibrator.angular_distance_degrees(bogus_rotation, initialized),
+                10.0,
+            )
+
     def test_deterministic_perturbation_is_exact_and_stable(self) -> None:
         identity = np.eye(3)
         first = calibrator.perturbed_rotation(identity, 10.0, 42, "lidar_a")
@@ -276,11 +409,31 @@ class PlanarNavigationCalibrationTest(unittest.TestCase):
 
         self.assertFalse(document["joint_backend"]["enabled"])
         self.assertEqual(document["joint_backend"]["mode"], "disabled")
+        self.assertFalse(
+            document["joint_backend"]["optimize_extrinsic_translation"]
+        )
         np.testing.assert_array_equal(
             document["lidars"][0]["vehicle_T_lidar"]["translation"],
             translation,
         )
         self.assertNotIn("extrinsic_prototxt", document["lidars"][0])
+
+        source_without_backend = dict(source)
+        source_without_backend.pop("joint_backend")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            manifest_path = output / "corrected.yaml"
+            calibrator.write_corrected_manifest(
+                manifest_path,
+                source_without_backend,
+                {"lidar": calibration},
+                output,
+            )
+            document = yaml.safe_load(manifest_path.read_text())
+        self.assertFalse(document["joint_backend"]["enabled"])
+        self.assertFalse(
+            document["joint_backend"]["optimize_extrinsic_translation"]
+        )
 
     def test_cross_lidar_alignment_reports_overlap(self) -> None:
         first = np.asarray([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]])

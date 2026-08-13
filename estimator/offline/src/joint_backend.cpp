@@ -432,6 +432,10 @@ bool solveStage(const std::vector<Sample>& samples,
     problem.SetParameterBlockConstant((*poses)[0].t.data());
     problem.SetParameterBlockConstant((*extrinsics)[reference_lidar].q.data());
     problem.SetParameterBlockConstant((*extrinsics)[reference_lidar].t.data());
+    if (!config.optimize_extrinsic_translation) {
+      for (auto& extrinsic : *extrinsics)
+        problem.SetParameterBlockConstant(extrinsic.t.data());
+    }
     if (stage == SolverStage::kPoseOnly) {
       for (auto& extrinsic : *extrinsics) {
         problem.SetParameterBlockConstant(extrinsic.q.data());
@@ -563,23 +567,36 @@ void fillHessianDiagnostics(
       diagnostics.condition_number = 1.0;
       continue;
     }
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(
-        hessians[lidar]);
-    if (solver.info() != Eigen::Success) {
-      diagnostics.condition_number =
-          std::numeric_limits<double>::infinity();
-      continue;
+    Eigen::VectorXd values;
+    if (config.optimize_extrinsic_translation) {
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> solver(
+          hessians[lidar]);
+      if (solver.info() != Eigen::Success) {
+        diagnostics.condition_number =
+            std::numeric_limits<double>::infinity();
+        continue;
+      }
+      values = solver.eigenvalues();
+    } else {
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(
+          hessians[lidar].topLeftCorner<3, 3>());
+      if (solver.info() != Eigen::Success) {
+        diagnostics.condition_number =
+            std::numeric_limits<double>::infinity();
+        continue;
+      }
+      values = solver.eigenvalues();
     }
-    const auto values = solver.eigenvalues();
     diagnostics.minimum_hessian_eigenvalue = values[0];
-    diagnostics.maximum_hessian_eigenvalue = values[5];
+    diagnostics.maximum_hessian_eigenvalue = values[values.size() - 1];
     diagnostics.condition_number =
         values[0] > 0.0
-            ? values[5] / values[0]
+            ? values[values.size() - 1] / values[0]
             : std::numeric_limits<double>::infinity();
     diagnostics.observable =
-        values[5] > 0.0 &&
-        values[0] / values[5] >= config.minimum_relative_eigenvalue &&
+        values[values.size() - 1] > 0.0 &&
+        values[0] / values[values.size() - 1] >=
+            config.minimum_relative_eigenvalue &&
         diagnostics.condition_number <= config.maximum_condition_number;
   }
 }

@@ -8,6 +8,12 @@ frame_end: 760
 frame_stride: 1
 minimum_finite_ratio: 0.95
 
+joint_backend:
+  enabled: false
+  mode: disabled
+  # Preserve surveyed vehicle-frame translations during optional MLCC replay.
+  optimize_extrinsic_translation: false
+
 lidars:
   - name: top
     enabled: true

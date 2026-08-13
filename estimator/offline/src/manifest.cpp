@@ -131,6 +131,7 @@ void parseJointBackend(const YAML::Node& node, JointBackendConfig* config) {
 #define READ_BACKEND_VALUE(name) \
   if (node[#name]) config->name = node[#name].as<decltype(config->name)>()
   READ_BACKEND_VALUE(initial_voxel_size);
+  READ_BACKEND_VALUE(optimize_extrinsic_translation);
   READ_BACKEND_VALUE(minimum_voxel_size);
   READ_BACKEND_VALUE(downsample_size);
   READ_BACKEND_VALUE(planarity_ratio);

@@ -12,15 +12,15 @@ limitations are documented in
 [`docs/methodology/fixed_translation_planar_multi_lidar_calibration.md`](../../docs/methodology/fixed_translation_planar_multi_lidar_calibration.md).
 The corresponding equations and observability derivation are in the
 [`mathematical establishment`](../../docs/methodology/fixed_translation_planar_multi_lidar_calibration_math.md).
-The measured AIV5 result is kept separately in the
-[`raw-IMU/GNSS 10-degree report`](../../docs/aiv5_raw_imu_gnss_10deg_results.md).
+The measured arbitrary-orientation result is in the
+[`AIV5 rotation-prior-free report`](../../docs/aiv5_rotation_prior_free_results.md).
 
 ## Planar-motion, known-translation calibration
 
 `planar_nav_rotation_calibrator.py` is the recommended prototype when the
-vehicle-frame LiDAR translations are trusted but the rotations can be wrong by
-roughly 10 degrees. It uses only raw IMU and raw dual-antenna GNSS navigation,
-plus the LiDAR PCD scans:
+vehicle-frame LiDAR translations are trusted and no usable rotation prior is
+available. It uses only raw IMU and raw dual-antenna GNSS navigation, plus the
+LiDAR PCD scans:
 
 1. Convert raw GNSS fixes to ENU and interpolate position with measured ENU
    velocity.
@@ -28,16 +28,37 @@ plus the LiDAR PCD scans:
 3. Integrate gyro-z and robustly anchor yaw to raw dual-antenna GNSS heading.
 4. Estimate the heading-baseline mounting yaw from straight GNSS velocity, or
    accept its measured value from the command line.
-5. Select 0.8--6 m motion pairs and measure LiDAR motion with coarse-to-fine
-   point-to-plane ICP.
-6. Alternate rotation-only hand-eye solves with one shared planar GNSS-antenna
-   lever-arm solve. Every `vehicle_T_lidar` translation remains exactly fixed.
-7. Reject a result unless held-out motion improves and its Hessian is
-   observable, then write a fixed-extrinsic manifest and ENU colored map.
+5. Select 0.8--6 m motion pairs and measure each LiDAR motion with
+   identity-seeded multiscale point-to-plane ICP.
+6. Recover a signed planar rotation axis for each LiDAR, reducing arbitrary
+   orientation to one yaw per sensor.
+7. Jointly solve all LiDAR yaws and one shared planar GNSS-antenna lever from
+   the translational hand-eye equation and known LiDAR translations.
+8. Retain a subsequent local rotation-only proposal only when held-out
+   validation improves; every `vehicle_T_lidar` translation remains exact.
+9. Publish a corrected manifest and raw-GNSS-anchored colored map only when
+   all axis, held-out, and Hessian gates pass.
 
 The LiDAR-localizer pose stream, final INS text output, and wheel result are
-not accepted as inputs. This workflow also does not run the MLCC-style
-backend.
+not accepted as inputs. The global initializer does not run the MLCC-style
+backend. Its generated manifest disables MLCC by default and records a
+rotation-only policy for an optional guarded replay.
+
+Run the rotation-prior-free calibration on AIV5:
+
+```bash
+python3 estimator/offline/tools/planar_nav_rotation_calibrator.py \
+  --manifest estimator/config/offline/aiv5_sequence.yaml \
+  --output-dir data/aiv5_rotation_prior_free \
+  --rotation-initialization prior-free \
+  --pair-count 40 --minimum-constraints 12 \
+  --map-stride 10 --map-voxel-size 0.35
+```
+
+In this mode a manifest `vehicle_T_lidar` may contain only `translation`; its
+`rpy_deg` is neither required nor parsed. For a controlled dataset evaluation,
+add `--score-against-manifest` to reveal manifest rotations only after the
+solve.
 
 Validate the 10-degree recovery basin deterministically on all enabled LiDARs:
 
@@ -45,20 +66,20 @@ Validate the 10-degree recovery basin deterministically on all enabled LiDARs:
 python3 estimator/offline/tools/planar_nav_rotation_calibrator.py \
   --manifest estimator/config/offline/aiv5_sequence.yaml \
   --output-dir data/aiv5_raw_imu_gnss_10deg \
+  --rotation-initialization manifest \
   --inject-rotation-error-deg 10 --seed 42 \
   --map-stride 10 --map-voxel-size 0.35
 ```
 
-For an actual coarse calibration, omit `--inject-rotation-error-deg`; the
-rotations resolved from the manifest become the starting values. The tool
-requires Python 3, NumPy, SciPy, PyYAML, and Open3D. It produces:
+The tool requires Python 3, NumPy, SciPy, PyYAML, and Open3D. It produces:
 
 - `summary.yaml`: raw-input quality, IMU/GNSS heading fit, GNSS lever arm,
   excitation, held-out residuals, observability, uncertainty, and (in
   injection mode) angular recovery error.
 - `pair_constraints.csv`: every ICP motion pair and its train/held-out status.
 - `corrected_manifest.yaml`: accepted rotations with the original translations
-  copied unchanged and the joint 6-DoF backend disabled.
+  copied unchanged, the joint backend disabled, and
+  `optimize_extrinsic_translation: false`.
 - `trajectory_navigation.csv`: GNSS-anchored vehicle and reference-LiDAR poses.
 - `map_initial_rgb.pcd` and `map_optimized_rgb.pcd`: before/after colored maps,
   plus one optimized map per LiDAR.
@@ -67,7 +88,7 @@ Run fixed-extrinsic M-LOAM with the accepted result:
 
 ```bash
 rosrun mloam mloam_offline_runner \
-  --manifest data/aiv5_raw_imu_gnss_10deg/corrected_manifest.yaml \
+  --manifest data/aiv5_rotation_prior_free/corrected_manifest.yaml \
   --scenario precise
 ```
 
@@ -90,12 +111,17 @@ per-LiDAR keyframe clouds, refines reference-LiDAR poses and all constant
 relative extrinsics, validates updates on held-out voxels, and rebuilds the
 entire historical map from native points after an accepted update.
 
+Set `joint_backend.optimize_extrinsic_translation: false` when translations
+are surveyed. Ceres then fixes every translation parameter block and the
+observability check uses only the three-dimensional rotation Hessian. The
+prior-free calibrator writes this setting automatically.
+
 Run mapping with trusted/precise extrinsics and allow a bounded consistency
 refinement:
 
 ```bash
 rosrun mloam mloam_offline_runner \
-  --manifest estimator/config/offline/aiv5_sequence.yaml \
+  --manifest data/aiv5_rotation_prior_free/corrected_manifest.yaml \
   --scenario precise \
   --backend-mode precise_refine
 ```
@@ -118,7 +144,8 @@ The backend never applies an update unless the mixed planar-voxel graph is
 connected, every auxiliary LiDAR has sufficient overlap, the held-out
 objective improves, the extrinsic Hessian is observable, and pose/extrinsic
 changes remain inside the configured bounds. Missing priors are intentionally
-unsupported.
+unsupported by MLCC itself; use the prior-free calibrator to enter its local
+capture basin.
 
 Additional artifacts are:
 
@@ -289,13 +316,18 @@ Important manifest rules:
 - Set `segment_cloud: false` to bypass range-image segmentation for a LiDAR.
   When enabled, the four segmentation parameters are applied to that LiDAR's
   native ring/column grid.
+- Under `joint_backend`, set `optimize_extrinsic_translation: false` whenever
+  vehicle-frame translations are surveyed. The default remains `true` for
+  compatibility with earlier full-extrinsic experiments.
 
 ### Extrinsic convention
 
-Every enabled LiDAR requires its calibrated `vehicle_T_lidar`. Inline
+The M-LOAM runner requires a complete calibrated `vehicle_T_lidar`. Inline
 `rpy_deg` is `[roll, pitch, yaw]` in degrees and is composed in Z-Y-X order.
-The runner converts the vehicle-frame calibrations to
-`reference_T_lidar` internally.
+The runner converts the vehicle-frame calibrations to `reference_T_lidar`
+internally. The separate prior-free calibrator is the exception: before it
+writes the complete corrected manifest, its input may contain only the
+vehicle-frame `translation`.
 
 Instead of an inline transform, a LiDAR may point to the existing calibration
 prototxt format:

@@ -19,9 +19,14 @@ velocities. Gyro-z is integrated and anchored to dual-antenna GNSS heading;
 stationary accelerometer samples provide the small fixed roll/pitch tilt. The
 unknown planar GNSS-antenna lever arm is estimated as a shared nuisance
 parameter while all LiDAR translations remain fixed. The resulting ENU
-trajectory and accepted extrinsics can build a colored global map. An optional
-deterministic perturbation mode validates the recovery basin without exposing
-trusted rotations to the optimizer.
+trajectory and accepted extrinsics can build a colored global map.
+
+In ``prior-free`` mode, identity-seeded ICP estimates each LiDAR's motion,
+signed planar motion axes determine two rotation degrees of freedom, and known
+translations provide a global Procrustes yaw. Manifest rotations are not
+parsed unless post-run scoring is explicitly requested. An optional
+deterministic perturbation mode separately validates the local recovery basin
+without exposing trusted rotations to optimizer residuals.
 """
 
 from __future__ import annotations
@@ -51,7 +56,7 @@ class LidarDefinition:
     name: str
     directory: Path
     translation: np.ndarray
-    trusted_rotation: np.ndarray
+    trusted_rotation: np.ndarray | None
     color: tuple[float, float, float]
 
 
@@ -74,6 +79,10 @@ class PairConstraint:
     icp_rotation_update_deg: float
     accepted: bool
     split: str = "rejected"
+    registration_mode: str = "extrinsic_seeded"
+    motion_angle_error_deg: float = math.inf
+    axis_error_deg: float = math.inf
+    rejection_reason: str = ""
 
 
 @dataclass
@@ -85,6 +94,7 @@ class RotationCalibration:
     constraints: list[PairConstraint] = field(default_factory=list)
     accepted: bool = False
     reason: str = ""
+    refinement_selected: bool = True
     update_deg: float = 0.0
     hessian_eigenvalues: list[float] = field(default_factory=list)
     hessian_condition_number: float = math.inf
@@ -148,6 +158,34 @@ class NavigationTrajectory:
         )
 
 
+@dataclass
+class PriorFreeLidarInitialization:
+    name: str
+    rotation: np.ndarray
+    vehicle_axis: np.ndarray
+    lidar_axis: np.ndarray
+    yaw_about_vehicle_axis_deg: float = 0.0
+    axis_samples: int = 0
+    axis_inliers: int = 0
+    axis_p95_deg: float = math.inf
+    train_metrics: dict[str, float] = field(default_factory=dict)
+    heldout_metrics: dict[str, float] = field(default_factory=dict)
+    accepted: bool = False
+    reason: str = ""
+
+
+@dataclass
+class PriorFreeInitialization:
+    lidars: dict[str, PriorFreeLidarInitialization]
+    gnss_lever_arm: np.ndarray
+    accepted: bool = False
+    reason: str = ""
+    starts_attempted: int = 0
+    selected_cost: float = math.inf
+    hessian_eigenvalues: list[float] = field(default_factory=list)
+    hessian_condition_number: float = math.inf
+
+
 def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
@@ -168,11 +206,42 @@ def arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=0.0,
         help="deterministically perturb every input rotation for validation",
     )
+    parser.add_argument(
+        "--rotation-initialization",
+        choices=("manifest", "prior-free"),
+        default="manifest",
+        help=(
+            "manifest uses the supplied mounting rotation as the ICP seed; "
+            "prior-free estimates independent LiDAR motion from identity and "
+            "recovers rotation from planar axes plus known translations"
+        ),
+    )
+    parser.add_argument(
+        "--score-against-manifest",
+        action="store_true",
+        help=(
+            "after optimization only, compare against manifest rotations; "
+            "this never contributes an initializer or residual"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--pair-count", type=int, default=40)
     parser.add_argument("--pair-frame-gap", type=int, default=15)
     parser.add_argument("--pair-candidate-stride", type=int, default=5)
     parser.add_argument("--calibration-voxel-size", type=float, default=0.45)
+    parser.add_argument("--prior-free-voxel-size", type=float, default=0.70)
+    parser.add_argument(
+        "--prior-free-coarse-distance", type=float, default=5.0
+    )
+    parser.add_argument(
+        "--prior-free-fallback-distance", type=float, default=8.0
+    )
+    parser.add_argument(
+        "--prior-free-motion-angle-tolerance-deg", type=float, default=2.5
+    )
+    parser.add_argument(
+        "--prior-free-axis-inlier-deg", type=float, default=4.0
+    )
     parser.add_argument("--minimum-range", type=float, default=2.0)
     parser.add_argument("--maximum-range", type=float, default=80.0)
     parser.add_argument("--minimum-constraints", type=int, default=12)
@@ -247,7 +316,10 @@ def resolve_path(base: Path, value: str) -> Path:
 
 
 def load_lidars(
-    manifest_path: Path, document: dict[str, Any], include: set[str] | None
+    manifest_path: Path,
+    document: dict[str, Any],
+    include: set[str] | None,
+    load_manifest_rotations: bool = True,
 ) -> list[LidarDefinition]:
     dataset_root = resolve_path(manifest_path.parent, str(document["dataset_root"]))
     result: list[LidarDefinition] = []
@@ -260,14 +332,24 @@ def load_lidars(
         if "vehicle_T_lidar" in node:
             transform = node["vehicle_T_lidar"]
             translation = np.asarray(transform["translation"], dtype=float)
-            rotation = Rotation.from_euler(
-                "xyz", np.asarray(transform["rpy_deg"], dtype=float), degrees=True
-            ).as_matrix()
+            rotation = None
+            if load_manifest_rotations:
+                if "rpy_deg" not in transform:
+                    raise ValueError(
+                        f"{name} has no manifest rotation for initialization/scoring"
+                    )
+                rotation = Rotation.from_euler(
+                    "xyz", np.asarray(transform["rpy_deg"], dtype=float), degrees=True
+                ).as_matrix()
         elif "extrinsic_prototxt" in node:
             calibration_path = resolve_path(
                 manifest_path.parent, str(node["extrinsic_prototxt"])
             )
-            rotation, translation = prototxt_calibration(calibration_path)
+            if load_manifest_rotations:
+                rotation, translation = prototxt_calibration(calibration_path)
+            else:
+                rotation = None
+                translation = block_vector(calibration_path.read_text(), "translation")
         else:
             raise ValueError(f"{name} has no vehicle-frame extrinsic")
         color = tuple(float(value) / 255.0 for value in node.get("color", [255, 255, 255]))
@@ -757,6 +839,543 @@ def multiscale_icp(
     return transform, float(result.fitness), float(result.inlier_rmse)
 
 
+def independent_motion_icp(
+    source: o3d.geometry.PointCloud,
+    target: o3d.geometry.PointCloud,
+    vehicle_rotation_deg: float,
+    voxel_size: float,
+    coarse_distance: float,
+    fallback_distance: float,
+    angle_tolerance_deg: float,
+) -> tuple[np.ndarray, float, float, float, str]:
+    """Register a LiDAR pair without consulting an extrinsic rotation.
+
+    Conjugation preserves rotation angle, so raw IMU/GNSS supplies a valid
+    hypothesis-selection test even though the LiDAR-frame rotation axis and
+    translation direction are unknown.  Both hypotheses start at identity;
+    only their coarse correspondence radii differ.
+    """
+
+    def schedule(coarse: float) -> list[float]:
+        values = [coarse, min(coarse, 3.0), min(coarse, 2.0), 1.0, voxel_size]
+        result: list[float] = []
+        for value in values:
+            value = max(voxel_size, float(value))
+            if not result or value < result[-1] - 1.0e-9:
+                result.append(value)
+        return result
+
+    def run(distances: Sequence[float]) -> tuple[np.ndarray, float, float, float]:
+        transform = np.eye(4)
+        result = None
+        for distance in distances:
+            result = o3d.pipelines.registration.registration_icp(
+                source,
+                target,
+                distance,
+                transform,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30),
+            )
+            transform = np.asarray(result.transformation).copy()
+        assert result is not None
+        measured_angle = math.degrees(
+            Rotation.from_matrix(transform[:3, :3]).magnitude()
+        )
+        angle_error = abs(measured_angle - vehicle_rotation_deg)
+        return transform, float(result.fitness), float(result.inlier_rmse), angle_error
+
+    hypotheses: list[tuple[np.ndarray, float, float, float, str]] = []
+    primary = run(schedule(coarse_distance))
+    hypotheses.append((*primary, "identity_multiscale_primary"))
+    primary_plausible = (
+        primary[1] >= 0.15
+        and primary[2] <= 0.90
+        and primary[3] <= angle_tolerance_deg
+        and np.linalg.norm(primary[0][:3, 3]) <= 10.0
+    )
+    if not primary_plausible and fallback_distance > coarse_distance + 1.0e-9:
+        fallback = run(schedule(fallback_distance))
+        hypotheses.append((*fallback, "identity_multiscale_fallback"))
+
+    def score(item: tuple[np.ndarray, float, float, float, str]) -> float:
+        transform, fitness, rmse, angle_error, _ = item
+        translation_penalty = max(0.0, np.linalg.norm(transform[:3, 3]) - 8.0)
+        return (
+            angle_error
+            + 0.25 * rmse
+            + 2.0 * max(0.0, 0.20 - fitness)
+            + translation_penalty
+        )
+
+    return min(hypotheses, key=score)
+
+
+def collect_prior_free_constraints(
+    lidar: LidarDefinition,
+    files: list[Path],
+    pairs: list[PairCandidate],
+    voxel_size: float,
+    minimum_range: float,
+    maximum_range: float,
+    coarse_distance: float,
+    fallback_distance: float,
+    angle_tolerance_deg: float,
+) -> list[PairConstraint]:
+    """Measure LiDAR-frame motion with no rotation or translation seed."""
+    cache: dict[int, o3d.geometry.PointCloud] = {}
+    constraints: list[PairConstraint] = []
+    for number, candidate in enumerate(pairs, start=1):
+        for index in (candidate.first, candidate.second):
+            if index not in cache:
+                cache[index] = load_cloud(
+                    files[index],
+                    voxel_size,
+                    minimum_range,
+                    maximum_range,
+                    estimate_normals=True,
+                )
+        measured, fitness, inlier_rmse, angle_error, mode = independent_motion_icp(
+            cache[candidate.second],
+            cache[candidate.first],
+            candidate.rotation_deg,
+            voxel_size,
+            coarse_distance,
+            fallback_distance,
+            angle_tolerance_deg,
+        )
+        measured_translation = float(np.linalg.norm(measured[:3, 3]))
+        measured_rotation = math.degrees(
+            Rotation.from_matrix(measured[:3, :3]).magnitude()
+        )
+        accepted = (
+            fitness >= 0.15
+            and inlier_rmse <= 0.90
+            and angle_error <= angle_tolerance_deg
+            and measured_translation <= 10.0
+        )
+        reasons: list[str] = []
+        if fitness < 0.15:
+            reasons.append("fitness below 0.15")
+        if inlier_rmse > 0.90:
+            reasons.append("RMSE above 0.90 m")
+        if angle_error > angle_tolerance_deg:
+            reasons.append("rotation-angle mismatch")
+        if measured_translation > 10.0:
+            reasons.append("translation above 10 m")
+        constraints.append(
+            PairConstraint(
+                candidate=candidate,
+                lidar_motion=measured,
+                fitness=fitness,
+                inlier_rmse_m=inlier_rmse,
+                icp_translation_update_m=measured_translation,
+                icp_rotation_update_deg=measured_rotation,
+                accepted=accepted,
+                registration_mode=mode,
+                motion_angle_error_deg=angle_error,
+                rejection_reason="; ".join(reasons),
+            )
+        )
+        print(
+            f"  {lidar.name}: prior-free ICP {number:02d}/{len(pairs)} "
+            f"fitness={fitness:.3f} rmse={inlier_rmse:.3f}m "
+            f"angle_error={angle_error:.2f}deg accepted={str(accepted).lower()}",
+            flush=True,
+        )
+    return constraints
+
+
+def assign_constraint_splits(constraints: Sequence[PairConstraint]) -> None:
+    usable = [constraint for constraint in constraints if constraint.accepted]
+    for index, constraint in enumerate(usable):
+        constraint.split = "heldout" if index % 5 == 0 else "train"
+
+
+def vector_angle_degrees(first: np.ndarray, second: np.ndarray) -> float:
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    denominator = np.linalg.norm(first) * np.linalg.norm(second)
+    if denominator <= 1.0e-15:
+        return math.inf
+    cosine = float(np.clip(np.dot(first, second) / denominator, -1.0, 1.0))
+    return math.degrees(math.acos(cosine))
+
+
+def minimal_rotation_between(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Return the minimum-angle active rotation mapping ``first`` to ``second``."""
+    source = np.asarray(first, dtype=float)
+    target = np.asarray(second, dtype=float)
+    source /= np.linalg.norm(source)
+    target /= np.linalg.norm(target)
+    cross = np.cross(source, target)
+    sine = float(np.linalg.norm(cross))
+    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    if sine > 1.0e-12:
+        return Rotation.from_rotvec(
+            cross / sine * math.atan2(sine, cosine)
+        ).as_matrix()
+    if cosine > 0.0:
+        return np.eye(3)
+    basis = np.eye(3)[int(np.argmin(np.abs(source)))]
+    axis = np.cross(source, basis)
+    axis /= np.linalg.norm(axis)
+    return Rotation.from_rotvec(math.pi * axis).as_matrix()
+
+
+def constraint_axis_samples(
+    constraints: Sequence[PairConstraint],
+) -> tuple[list[PairConstraint], np.ndarray, np.ndarray, np.ndarray]:
+    selected: list[PairConstraint] = []
+    vehicle_axes: list[np.ndarray] = []
+    lidar_axes: list[np.ndarray] = []
+    weights: list[float] = []
+    for constraint in constraints:
+        if not constraint.accepted:
+            continue
+        vehicle_vector = Rotation.from_matrix(
+            constraint.candidate.vehicle_motion[:3, :3]
+        ).as_rotvec()
+        lidar_vector = Rotation.from_matrix(
+            constraint.lidar_motion[:3, :3]
+        ).as_rotvec()
+        if np.linalg.norm(vehicle_vector) < math.radians(1.0):
+            continue
+        if np.linalg.norm(lidar_vector) < math.radians(0.5):
+            continue
+        vehicle_axis = vehicle_vector / np.linalg.norm(vehicle_vector)
+        lidar_axis = lidar_vector / np.linalg.norm(lidar_vector)
+        sign = 1.0 if vehicle_axis[2] >= 0.0 else -1.0
+        selected.append(constraint)
+        vehicle_axes.append(sign * vehicle_axis)
+        lidar_axes.append(sign * lidar_axis)
+        weights.append(
+            math.sqrt(max(0.05, constraint.fitness))
+            * np.linalg.norm(vehicle_vector)
+            / max(0.10, constraint.inlier_rmse_m)
+        )
+    return (
+        selected,
+        np.asarray(vehicle_axes),
+        np.asarray(lidar_axes),
+        np.asarray(weights),
+    )
+
+
+def robust_planar_axes(
+    constraints: Sequence[PairConstraint], axis_inlier_deg: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Estimate the conjugate planar rotation axes with a one-sample RANSAC."""
+    selected, vehicle_axes, lidar_axes, weights = constraint_axis_samples(constraints)
+    if len(selected) < 3:
+        raise ValueError(f"need three rotational motion samples; got {len(selected)}")
+    best_support = np.zeros(len(selected), dtype=bool)
+    best_weight = -math.inf
+    for hypothesis in lidar_axes:
+        errors = np.asarray(
+            [vector_angle_degrees(hypothesis, sample) for sample in lidar_axes]
+        )
+        support = errors <= axis_inlier_deg
+        support_weight = float(np.sum(weights[support]))
+        if np.count_nonzero(support) >= 3 and support_weight > best_weight:
+            best_support = support
+            best_weight = support_weight
+    if np.count_nonzero(best_support) < 3:
+        raise ValueError("no consistent LiDAR rotation-axis cluster")
+    lidar_axis = np.average(
+        lidar_axes[best_support], axis=0, weights=weights[best_support]
+    )
+    vehicle_axis = np.average(
+        vehicle_axes[best_support], axis=0, weights=weights[best_support]
+    )
+    lidar_axis /= np.linalg.norm(lidar_axis)
+    vehicle_axis /= np.linalg.norm(vehicle_axis)
+    all_errors = np.asarray(
+        [vector_angle_degrees(lidar_axis, sample) for sample in lidar_axes]
+    )
+    support = all_errors <= axis_inlier_deg
+    p95 = float(np.percentile(all_errors[support], 95))
+    for constraint, error in zip(selected, all_errors):
+        constraint.axis_error_deg = float(error)
+        if error > axis_inlier_deg:
+            constraint.accepted = False
+            constraint.rejection_reason = "rotation axis is inconsistent"
+    return vehicle_axis, lidar_axis, support, p95
+
+
+def basis_perpendicular_to(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    unit_axis = np.asarray(axis, dtype=float)
+    unit_axis /= np.linalg.norm(unit_axis)
+    seed = np.eye(3)[int(np.argmin(np.abs(unit_axis)))]
+    first = seed - unit_axis * np.dot(unit_axis, seed)
+    first /= np.linalg.norm(first)
+    second = np.cross(unit_axis, first)
+    return first, second
+
+
+def planar_yaw_procrustes(
+    base_rotation: np.ndarray,
+    vehicle_axis: np.ndarray,
+    translation: np.ndarray,
+    constraints: Sequence[PairConstraint],
+    gnss_lever_arm: np.ndarray,
+) -> float:
+    """Solve the remaining rotation about the planar vehicle axis globally."""
+    first, second = basis_perpendicular_to(vehicle_axis)
+    cosine_term = 0.0
+    sine_term = 0.0
+    for constraint in constraints:
+        if not constraint.accepted or constraint.split != "train":
+            continue
+        vehicle_motion = motion_at_vehicle_origin(
+            constraint.candidate.vehicle_motion, gnss_lever_arm
+        )
+        target = (
+            vehicle_motion[:3, 3]
+            + (vehicle_motion[:3, :3] - np.eye(3)) @ translation
+        )
+        source = base_rotation @ constraint.lidar_motion[:3, 3]
+        source_xy = np.asarray([np.dot(first, source), np.dot(second, source)])
+        target_xy = np.asarray([np.dot(first, target), np.dot(second, target)])
+        weight = math.sqrt(max(0.05, constraint.fitness)) / max(
+            0.10, constraint.inlier_rmse_m
+        )
+        cosine_term += weight * float(np.dot(target_xy, source_xy))
+        sine_term += weight * float(
+            target_xy[1] * source_xy[0] - target_xy[0] * source_xy[1]
+        )
+    if math.hypot(cosine_term, sine_term) <= 1.0e-12:
+        raise ValueError("planar translation supplies no yaw information")
+    return math.atan2(sine_term, cosine_term)
+
+
+def estimate_prior_free_initialization(
+    lidars: Sequence[LidarDefinition],
+    constraints_by_lidar: dict[str, list[PairConstraint]],
+    minimum_constraints: int,
+    lever_arm_bound_m: float,
+    axis_inlier_deg: float,
+) -> PriorFreeInitialization:
+    """Recover arbitrary LiDAR rotations from motion axes and fixed translations."""
+    lidar_by_name = {lidar.name: lidar for lidar in lidars}
+    names = [lidar.name for lidar in lidars]
+    output = PriorFreeInitialization(lidars={}, gnss_lever_arm=np.zeros(3))
+    base_rotations: dict[str, np.ndarray] = {}
+    for name in names:
+        constraints = constraints_by_lidar[name]
+        assign_constraint_splits(constraints)
+        training = [
+            item
+            for item in constraints
+            if item.accepted and item.split == "train"
+        ]
+        axis_samples = len(training)
+        try:
+            vehicle_axis, lidar_axis, support, p95 = robust_planar_axes(
+                training, axis_inlier_deg
+            )
+            del support
+            selected_all, _, lidar_axes_all, _ = constraint_axis_samples(constraints)
+            for constraint, sample_axis in zip(selected_all, lidar_axes_all):
+                error = vector_angle_degrees(lidar_axis, sample_axis)
+                constraint.axis_error_deg = error
+                if error > axis_inlier_deg:
+                    constraint.accepted = False
+                    constraint.rejection_reason = "rotation axis is inconsistent"
+            base_rotation = minimal_rotation_between(lidar_axis, vehicle_axis)
+            base_rotations[name] = base_rotation
+            axis_inliers = sum(
+                item.accepted and item.axis_error_deg <= axis_inlier_deg
+                for item in training
+            )
+            output.lidars[name] = PriorFreeLidarInitialization(
+                name=name,
+                rotation=base_rotation,
+                vehicle_axis=vehicle_axis,
+                lidar_axis=lidar_axis,
+                axis_samples=axis_samples,
+                axis_inliers=axis_inliers,
+                axis_p95_deg=p95,
+            )
+        except ValueError as error:
+            output.lidars[name] = PriorFreeLidarInitialization(
+                name=name,
+                rotation=np.eye(3),
+                vehicle_axis=np.asarray([0.0, 0.0, 1.0]),
+                lidar_axis=np.asarray([0.0, 0.0, 1.0]),
+                reason=str(error),
+            )
+    if len(base_rotations) != len(names):
+        output.reason = "at least one LiDAR lacks a consistent planar rotation axis"
+        return output
+
+    training_by_lidar = {
+        name: [
+            item
+            for item in constraints_by_lidar[name]
+            if item.accepted and item.split == "train"
+        ]
+        for name in names
+    }
+
+    def rotations(parameters: np.ndarray) -> dict[str, np.ndarray]:
+        return {
+            name: Rotation.from_rotvec(
+                parameters[index] * output.lidars[name].vehicle_axis
+            ).as_matrix()
+            @ base_rotations[name]
+            for index, name in enumerate(names)
+        }
+
+    def residual(parameters: np.ndarray) -> np.ndarray:
+        lever_arm = np.asarray([parameters[-2], parameters[-1], 0.0])
+        current_rotations = rotations(parameters)
+        values: list[float] = []
+        for name in names:
+            lidar = lidar_by_name[name]
+            current_rotation = current_rotations[name]
+            for constraint in training_by_lidar[name]:
+                vehicle_motion = motion_at_vehicle_origin(
+                    constraint.candidate.vehicle_motion, lever_arm
+                )
+                target = (
+                    vehicle_motion[:3, 3]
+                    + (vehicle_motion[:3, :3] - np.eye(3)) @ lidar.translation
+                )
+                measured = current_rotation @ constraint.lidar_motion[:3, 3]
+                weight = math.sqrt(max(0.05, constraint.fitness)) / max(
+                    0.10, constraint.inlier_rmse_m
+                )
+                values.extend(weight * (measured - target))
+        return np.asarray(values)
+
+    lever_seeds = [np.zeros(2)]
+    lever_seeds.extend(lidar.translation[:2] for lidar in lidars)
+    lever_seeds.append(
+        np.median(np.asarray([lidar.translation[:2] for lidar in lidars]), axis=0)
+    )
+    unique_seeds: list[np.ndarray] = []
+    for seed in lever_seeds:
+        clipped = np.clip(
+            np.asarray(seed, dtype=float),
+            -0.999 * lever_arm_bound_m,
+            0.999 * lever_arm_bound_m,
+        )
+        if not any(np.linalg.norm(clipped - prior) < 1.0e-6 for prior in unique_seeds):
+            unique_seeds.append(clipped)
+
+    best_solution = None
+    for lever_seed in unique_seeds:
+        lever = np.asarray([lever_seed[0], lever_seed[1], 0.0])
+        beta = []
+        try:
+            for name in names:
+                beta.append(
+                    planar_yaw_procrustes(
+                        base_rotations[name],
+                        output.lidars[name].vehicle_axis,
+                        lidar_by_name[name].translation,
+                        training_by_lidar[name],
+                        lever,
+                    )
+                )
+        except ValueError:
+            continue
+        initial = np.asarray([*beta, *lever_seed])
+        lower = np.asarray([-4.0 * math.pi] * len(names) + [-lever_arm_bound_m] * 2)
+        upper = np.asarray([4.0 * math.pi] * len(names) + [lever_arm_bound_m] * 2)
+        solution = least_squares(
+            residual,
+            initial,
+            bounds=(lower, upper),
+            loss="cauchy",
+            f_scale=1.0,
+            max_nfev=400,
+        )
+        output.starts_attempted += 1
+        if best_solution is None or solution.cost < best_solution.cost:
+            best_solution = solution
+    if best_solution is None:
+        output.reason = "no prior-free yaw/lever-arm start was solvable"
+        return output
+
+    output.selected_cost = float(best_solution.cost)
+    output.gnss_lever_arm = np.asarray(
+        [best_solution.x[-2], best_solution.x[-1], 0.0]
+    )
+    final_rotations = rotations(best_solution.x)
+    hessian = best_solution.jac.T @ best_solution.jac
+    eigenvalues = np.linalg.eigvalsh(hessian)
+    output.hessian_eigenvalues = eigenvalues.tolist()
+    output.hessian_condition_number = (
+        float(eigenvalues[-1] / eigenvalues[0])
+        if eigenvalues.size and eigenvalues[0] > 0.0
+        else math.inf
+    )
+    observable = (
+        eigenvalues.size == len(names) + 2
+        and eigenvalues[0] > 1.0e-9
+        and math.isfinite(output.hessian_condition_number)
+        and output.hessian_condition_number < 1.0e8
+    )
+    for index, name in enumerate(names):
+        lidar_output = output.lidars[name]
+        lidar_output.rotation = final_rotations[name]
+        lidar_output.yaw_about_vehicle_axis_deg = math.degrees(best_solution.x[index])
+        training = training_by_lidar[name]
+        heldout = [
+            item
+            for item in constraints_by_lidar[name]
+            if item.accepted and item.split == "heldout"
+        ]
+        lidar_output.train_metrics = constraint_metrics(
+            final_rotations[name],
+            lidar_by_name[name].translation,
+            training,
+            output.gnss_lever_arm,
+        )
+        lidar_output.heldout_metrics = constraint_metrics(
+            final_rotations[name],
+            lidar_by_name[name].translation,
+            heldout,
+            output.gnss_lever_arm,
+        )
+        enough = len(training) >= max(3, minimum_constraints * 3 // 5) and bool(heldout)
+        axis_good = (
+            lidar_output.axis_inliers >= max(3, minimum_constraints * 3 // 5)
+            and lidar_output.axis_p95_deg <= axis_inlier_deg
+        )
+        heldout_good = (
+            lidar_output.heldout_metrics["translation_rmse_m"] <= 0.75
+            and lidar_output.heldout_metrics["rotation_rmse_deg"] <= 2.5
+        )
+        lidar_output.accepted = bool(enough and axis_good and heldout_good)
+        if not enough:
+            lidar_output.reason = "not enough train/held-out independent motions"
+        elif not axis_good:
+            lidar_output.reason = "LiDAR rotation axis is not stable"
+        elif not heldout_good:
+            lidar_output.reason = "held-out hand-eye residual exceeds capture gate"
+        else:
+            lidar_output.reason = (
+                "accepted: axis plus fixed-translation yaw initialized"
+            )
+    output.accepted = bool(
+        best_solution.success
+        and observable
+        and all(item.accepted for item in output.lidars.values())
+    )
+    if not best_solution.success:
+        output.reason = f"joint prior-free solve failed: {best_solution.message}"
+    elif not observable:
+        output.reason = "joint yaw/lever-arm Hessian is rank-deficient"
+    elif not output.accepted:
+        output.reason = "at least one LiDAR failed prior-free validation"
+    else:
+        output.reason = "accepted: rotation priors were not used"
+    return output
+
+
 def collect_constraints(
     lidar: LidarDefinition,
     files: list[Path],
@@ -902,6 +1521,7 @@ def calibrate_rotation(
     update_bound_deg: float,
     trusted_rotation: np.ndarray | None,
     gnss_lever_arm_vehicle: np.ndarray | None = None,
+    require_heldout_improvement: bool = True,
 ) -> RotationCalibration:
     result = RotationCalibration(
         name=lidar.name,
@@ -911,8 +1531,8 @@ def calibrate_rotation(
         constraints=constraints,
     )
     usable = [constraint for constraint in constraints if constraint.accepted]
-    for index, constraint in enumerate(usable):
-        constraint.split = "heldout" if index % 5 == 0 else "train"
+    if not any(constraint.split in ("train", "heldout") for constraint in usable):
+        assign_constraint_splits(constraints)
     training = [constraint for constraint in usable if constraint.split == "train"]
     heldout = [constraint for constraint in usable if constraint.split == "heldout"]
     if trusted_rotation is not None:
@@ -975,6 +1595,24 @@ def calibrate_rotation(
             trusted_rotation, optimized_rotation
         )
 
+    if not require_heldout_improvement:
+        initial_selection_score = (
+            result.heldout_initial["translation_rmse_m"] / 0.20
+            + result.heldout_initial["rotation_rmse_deg"] / 0.20
+        )
+        final_selection_score = (
+            result.heldout_final["translation_rmse_m"] / 0.20
+            + result.heldout_final["rotation_rmse_deg"] / 0.20
+        )
+        if final_selection_score > initial_selection_score:
+            result.refinement_selected = False
+            result.optimized_rotation = initial_rotation.copy()
+            result.update_deg = 0.0
+            result.train_final = dict(result.train_initial)
+            result.heldout_final = dict(result.heldout_initial)
+            if trusted_rotation is not None:
+                result.trusted_final_error_deg = result.trusted_initial_error_deg
+
     hessian = solution.jac.T @ solution.jac
     eigenvalues = np.linalg.eigvalsh(hessian)
     result.hessian_eigenvalues = eigenvalues.tolist()
@@ -992,9 +1630,20 @@ def calibrate_rotation(
         result.heldout_final["translation_rmse_m"]
         < result.heldout_initial["translation_rmse_m"]
     )
+    heldout_translation_accepted = (
+        heldout_translation_improved
+        if require_heldout_improvement
+        else result.heldout_final["translation_rmse_m"]
+        <= max(
+            result.heldout_initial["translation_rmse_m"] + 1.0e-6,
+            1.05 * result.heldout_initial["translation_rmse_m"],
+        )
+    )
     heldout_rotation_not_regressed = (
         result.heldout_final["rotation_rmse_deg"]
         <= 1.05 * result.heldout_initial["rotation_rmse_deg"]
+        if require_heldout_improvement
+        else result.heldout_final["rotation_rmse_deg"] <= 2.5
     )
     observable = (
         eigenvalues[0] > 1.0e-9
@@ -1006,7 +1655,7 @@ def calibrate_rotation(
         solution.success
         and observable
         and bounded
-        and heldout_translation_improved
+        and heldout_translation_accepted
         and heldout_rotation_not_regressed
     )
     if not solution.success:
@@ -1015,12 +1664,20 @@ def calibrate_rotation(
         result.reason = "rotation Hessian is rank-deficient or ill-conditioned"
     elif not bounded:
         result.reason = "rotation update exceeded configured bound"
-    elif not heldout_translation_improved:
-        result.reason = "held-out translation consistency did not improve"
+    elif not heldout_translation_accepted:
+        result.reason = (
+            "held-out translation consistency did not improve"
+            if require_heldout_improvement
+            else "held-out translation consistency regressed"
+        )
     elif not heldout_rotation_not_regressed:
         result.reason = "held-out rotation consistency regressed"
     else:
-        result.reason = "accepted: fixed-translation hand-eye validation passed"
+        result.reason = (
+            "accepted: prior-free initializer retained by held-out validation"
+            if not result.refinement_selected
+            else "accepted: fixed-translation hand-eye validation passed"
+        )
     return result
 
 
@@ -1350,6 +2007,7 @@ def calibration_document(calibration: RotationCalibration) -> dict[str, Any]:
         "initial_rotation": rotation_values(calibration.initial_rotation),
         "optimized_rotation": rotation_values(calibration.optimized_rotation),
         "rotation_update_deg": calibration.update_deg,
+        "refinement_selected": calibration.refinement_selected,
         "trusted_initial_error_deg": calibration.trusted_initial_error_deg,
         "trusted_final_error_deg": calibration.trusted_final_error_deg,
         "constraints_attempted": len(calibration.constraints),
@@ -1366,29 +2024,67 @@ def calibration_document(calibration: RotationCalibration) -> dict[str, Any]:
     }
 
 
+def prior_free_initialization_document(
+    initialization: PriorFreeInitialization | None,
+) -> dict[str, Any]:
+    if initialization is None:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "accepted": initialization.accepted,
+        "reason": initialization.reason,
+        "manifest_rotations_used": False,
+        "independent_motion_seed": "identity",
+        "gnss_lever_arm_vehicle_m": initialization.gnss_lever_arm.tolist(),
+        "starts_attempted": initialization.starts_attempted,
+        "selected_cost": initialization.selected_cost,
+        "hessian_eigenvalues": initialization.hessian_eigenvalues,
+        "hessian_condition_number": initialization.hessian_condition_number,
+        "lidars": {
+            name: {
+                "accepted": item.accepted,
+                "reason": item.reason,
+                "rotation": rotation_values(item.rotation),
+                "vehicle_planar_axis": item.vehicle_axis.tolist(),
+                "lidar_planar_axis": item.lidar_axis.tolist(),
+                "yaw_about_vehicle_axis_deg": item.yaw_about_vehicle_axis_deg,
+                "axis_samples": item.axis_samples,
+                "axis_inliers": item.axis_inliers,
+                "axis_p95_deg": item.axis_p95_deg,
+                "train": item.train_metrics,
+                "heldout": item.heldout_metrics,
+            }
+            for name, item in initialization.lidars.items()
+        },
+    }
+
+
 def relative_extrinsics_document(
     lidars: Sequence[LidarDefinition],
     calibrations: dict[str, RotationCalibration],
     reference_name: str,
+    score_against_manifest: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     definitions = {lidar.name: lidar for lidar in lidars}
     reference = calibrations[reference_name]
     optimized_reference = make_transform(
         reference.optimized_rotation, reference.fixed_translation
     )
-    trusted_reference = make_transform(
-        definitions[reference_name].trusted_rotation,
-        definitions[reference_name].translation,
-    )
+    trusted_reference = None
+    if score_against_manifest:
+        reference_rotation = definitions[reference_name].trusted_rotation
+        if reference_rotation is None:
+            raise ValueError("reference LiDAR has no manifest rotation for scoring")
+        trusted_reference = make_transform(
+            reference_rotation,
+            definitions[reference_name].translation,
+        )
     output: dict[str, Any] = {}
     pair_errors: list[dict[str, Any]] = []
     for lidar in lidars:
         calibration = calibrations[lidar.name]
         optimized = inverse(optimized_reference) @ make_transform(
             calibration.optimized_rotation, calibration.fixed_translation
-        )
-        trusted = inverse(trusted_reference) @ make_transform(
-            lidar.trusted_rotation, lidar.translation
         )
         output[lidar.name] = {
             "reference_T_lidar": [
@@ -1400,10 +2096,16 @@ def relative_extrinsics_document(
                     ).as_quat()
                 ],
             ],
-            "rotation_difference_from_manifest_deg": angular_distance_degrees(
-                trusted[:3, :3], optimized[:3, :3]
-            ),
         }
+        if score_against_manifest:
+            if lidar.trusted_rotation is None or trusted_reference is None:
+                raise ValueError(f"{lidar.name} has no manifest rotation for scoring")
+            trusted = inverse(trusted_reference) @ make_transform(
+                lidar.trusted_rotation, lidar.translation
+            )
+            output[lidar.name]["rotation_difference_from_manifest_deg"] = (
+                angular_distance_degrees(trusted[:3, :3], optimized[:3, :3])
+            )
     for first_index, first in enumerate(lidars):
         for second in lidars[first_index + 1 :]:
             first_calibration = calibrations[first.name]
@@ -1412,20 +2114,29 @@ def relative_extrinsics_document(
                 first_calibration.optimized_rotation.T
                 @ second_calibration.optimized_rotation
             )
-            trusted_relative_rotation = (
-                first.trusted_rotation.T @ second.trusted_rotation
-            )
-            pair_errors.append(
-                {
-                    "first": first.name,
-                    "second": second.name,
-                    "rotation_error_deg": angular_distance_degrees(
-                        trusted_relative_rotation, optimized_relative_rotation
-                    ),
-                }
-            )
+            if score_against_manifest:
+                if (
+                    first.trusted_rotation is None
+                    or second.trusted_rotation is None
+                ):
+                    raise ValueError(
+                        "all LiDARs need manifest rotations for relative scoring"
+                    )
+                trusted_relative_rotation = (
+                    first.trusted_rotation.T @ second.trusted_rotation
+                )
+                pair_errors.append(
+                    {
+                        "first": first.name,
+                        "second": second.name,
+                        "rotation_error_deg": angular_distance_degrees(
+                            trusted_relative_rotation, optimized_relative_rotation
+                        ),
+                    }
+                )
     errors = np.asarray([item["rotation_error_deg"] for item in pair_errors])
     metrics = {
+        "scored": score_against_manifest,
         "pairs": pair_errors,
         "mean_rotation_error_deg": float(np.mean(errors)) if errors.size else 0.0,
         "p95_rotation_error_deg": (
@@ -1450,8 +2161,12 @@ def write_constraints(path: Path, calibrations: Iterable[RotationCalibration]) -
                 "icp_inlier_rmse_m",
                 "icp_translation_update_m",
                 "icp_rotation_update_deg",
+                "registration_mode",
+                "motion_angle_error_deg",
+                "axis_error_deg",
                 "accepted",
                 "split",
+                "rejection_reason",
             ]
         )
         for calibration in calibrations:
@@ -1468,8 +2183,12 @@ def write_constraints(path: Path, calibrations: Iterable[RotationCalibration]) -
                         constraint.inlier_rmse_m,
                         constraint.icp_translation_update_m,
                         constraint.icp_rotation_update_deg,
+                        constraint.registration_mode,
+                        constraint.motion_angle_error_deg,
+                        constraint.axis_error_deg,
                         str(constraint.accepted).lower(),
                         constraint.split,
+                        constraint.rejection_reason,
                     ]
                 )
 
@@ -1540,9 +2259,12 @@ def write_corrected_manifest(
     document = copy.deepcopy(source)
     document["output_root"] = str((output_dir / "mloam_fixed").resolve())
     backend = document.get("joint_backend")
-    if isinstance(backend, dict):
-        backend["enabled"] = False
-        backend["mode"] = "disabled"
+    if not isinstance(backend, dict):
+        backend = {}
+        document["joint_backend"] = backend
+    backend["enabled"] = False
+    backend["mode"] = "disabled"
+    backend["optimize_extrinsic_translation"] = False
     for lidar in document.get("lidars", []):
         name = str(lidar["name"])
         if name not in calibrations:
@@ -1581,14 +2303,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     options = arguments(argv)
     if options.inject_rotation_error_deg < 0.0:
         raise ValueError("injected rotation error must be non-negative")
+    if (
+        options.rotation_initialization == "prior-free"
+        and options.inject_rotation_error_deg > 0.0
+    ):
+        raise ValueError(
+            "--inject-rotation-error-deg is a manifest-initialization test; "
+            "it cannot be combined with --rotation-initialization prior-free"
+        )
     if options.gnss_lever_arm_bound_m <= 0.0:
         raise ValueError("GNSS lever-arm bound must be positive")
     if options.lever_arm_outer_iterations <= 0:
         raise ValueError("lever-arm outer iterations must be positive")
+    if options.prior_free_voxel_size <= 0.0:
+        raise ValueError("prior-free voxel size must be positive")
+    if options.prior_free_coarse_distance <= options.prior_free_voxel_size:
+        raise ValueError("prior-free coarse distance must exceed its voxel size")
     manifest_path = options.manifest.resolve()
     manifest = yaml.safe_load(manifest_path.read_text())
     include = set(options.include.split(",")) if options.include else None
-    lidars = load_lidars(manifest_path, manifest, include)
+    load_manifest_rotations = bool(
+        options.rotation_initialization == "manifest"
+        or options.score_against_manifest
+        or options.inject_rotation_error_deg > 0.0
+    )
+    lidars = load_lidars(
+        manifest_path,
+        manifest,
+        include,
+        load_manifest_rotations=load_manifest_rotations,
+    )
     dataset_root = resolve_path(manifest_path.parent, str(manifest["dataset_root"]))
     imu_file = options.imu_file or dataset_root / "imu.txt"
     gnss_dir = options.gnss_dir or dataset_root / "gnss"
@@ -1621,28 +2365,79 @@ def main(argv: Sequence[str] | None = None) -> int:
             options.pair_candidate_stride,
             options.pair_count,
         )
-        initial_rotation = perturbed_rotation(
-            lidar.trusted_rotation,
-            options.inject_rotation_error_deg,
-            options.seed,
-            lidar.name,
-        )
-        initial_rotations[lidar.name] = initial_rotation
-        constraints = collect_constraints(
-            lidar,
-            files,
-            pairs,
-            initial_rotation,
-            options.calibration_voxel_size,
-            options.minimum_range,
-            options.maximum_range,
-            np.zeros(3),
-        )
+        if options.rotation_initialization == "prior-free":
+            constraints = collect_prior_free_constraints(
+                lidar,
+                files,
+                pairs,
+                options.prior_free_voxel_size,
+                options.minimum_range,
+                options.maximum_range,
+                options.prior_free_coarse_distance,
+                options.prior_free_fallback_distance,
+                options.prior_free_motion_angle_tolerance_deg,
+            )
+        else:
+            if lidar.trusted_rotation is None:
+                raise ValueError(
+                    f"{lidar.name} has no manifest rotation for manifest initialization"
+                )
+            initial_rotation = perturbed_rotation(
+                lidar.trusted_rotation,
+                options.inject_rotation_error_deg,
+                options.seed,
+                lidar.name,
+            )
+            initial_rotations[lidar.name] = initial_rotation
+            constraints = collect_constraints(
+                lidar,
+                files,
+                pairs,
+                initial_rotation,
+                options.calibration_voxel_size,
+                options.minimum_range,
+                options.maximum_range,
+                np.zeros(3),
+            )
         constraints_by_lidar[lidar.name] = constraints
 
-    gnss_lever_arm = np.zeros(3)
+    prior_free_initialization: PriorFreeInitialization | None = None
+    if options.rotation_initialization == "prior-free":
+        print("Solving rotation-prior-free planar axis and yaw initializer", flush=True)
+        prior_free_initialization = estimate_prior_free_initialization(
+            lidars,
+            constraints_by_lidar,
+            options.minimum_constraints,
+            options.gnss_lever_arm_bound_m,
+            options.prior_free_axis_inlier_deg,
+        )
+        initial_rotations = {
+            name: item.rotation.copy()
+            for name, item in prior_free_initialization.lidars.items()
+        }
+        gnss_lever_arm = prior_free_initialization.gnss_lever_arm.copy()
+        print(
+            f"Prior-free initializer accepted={prior_free_initialization.accepted}; "
+            f"lever_arm={gnss_lever_arm.tolist()}; "
+            f"{prior_free_initialization.reason}",
+            flush=True,
+        )
+        for name, item in prior_free_initialization.lidars.items():
+            print(
+                f"  {name}: accepted={item.accepted}, "
+                f"axis_p95={item.axis_p95_deg:.2f}deg, "
+                "heldout_translation="
+                f"{item.heldout_metrics.get('translation_rmse_m', math.inf):.3f}m; "
+                f"{item.reason}",
+                flush=True,
+            )
+    else:
+        gnss_lever_arm = np.zeros(3)
     lever_estimate = NavigationLeverArmEstimate(
         value=gnss_lever_arm.copy(), reason="not solved"
+    )
+    score_rotations = (
+        options.score_against_manifest or options.inject_rotation_error_deg > 0.0
     )
     calibrations: dict[str, RotationCalibration] = {}
     for outer_iteration in range(options.lever_arm_outer_iterations):
@@ -1653,10 +2448,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 constraints_by_lidar[lidar.name],
                 options.minimum_constraints,
                 options.rotation_update_bound_deg,
-                lidar.trusted_rotation
-                if options.inject_rotation_error_deg > 0.0
-                else None,
+                lidar.trusted_rotation if score_rotations else None,
                 gnss_lever_arm,
+                options.rotation_initialization != "prior-free",
             )
             for lidar in lidars
         }
@@ -1686,10 +2480,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             constraints_by_lidar[lidar.name],
             options.minimum_constraints,
             options.rotation_update_bound_deg,
-            lidar.trusted_rotation
-            if options.inject_rotation_error_deg > 0.0
-            else None,
+            lidar.trusted_rotation if score_rotations else None,
             gnss_lever_arm,
+            options.rotation_initialization != "prior-free",
         )
         for lidar in lidars
     }
@@ -1710,7 +2503,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     reference_name = str(manifest["reference_lidar"])
     if reference_name not in calibrations:
         raise ValueError("selected LiDARs must include the manifest reference LiDAR")
-    all_accepted = lever_estimate.accepted and all(
+    initializer_accepted = (
+        prior_free_initialization is None or prior_free_initialization.accepted
+    )
+    all_accepted = initializer_accepted and lever_estimate.accepted and all(
         calibration.accepted for calibration in calibrations.values()
     )
     write_constraints(output_dir / "pair_constraints.csv", calibrations.values())
@@ -1729,7 +2525,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             output_dir,
         )
     relative_extrinsics, relative_metrics = relative_extrinsics_document(
-        lidars, calibrations, reference_name
+        lidars,
+        calibrations,
+        reference_name,
+        score_against_manifest=(
+            options.rotation_initialization == "manifest" or score_rotations
+        ),
     )
     (output_dir / "relative_extrinsics.yaml").write_text(
         yaml.safe_dump(safe_yaml_value(relative_extrinsics), sort_keys=False)
@@ -1757,14 +2558,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     summary = {
         "status": "success" if all_accepted else "non_converged",
-        "algorithm": "fixed_translation_raw_imu_gnss_handeye_icp",
+        "algorithm": (
+            "rotation_prior_free_fixed_translation_raw_imu_gnss_handeye_icp"
+            if options.rotation_initialization == "prior-free"
+            else "fixed_translation_raw_imu_gnss_handeye_icp"
+        ),
         "manifest": str(manifest_path),
         "dataset_root": str(dataset_root),
         "reference_lidar": reference_name,
         "seed": options.seed,
+        "rotation_initialization": options.rotation_initialization,
+        "manifest_rotations_used_for_initialization": (
+            options.rotation_initialization == "manifest"
+        ),
+        "score_against_manifest_after_optimization": score_rotations,
         "injected_rotation_error_deg": options.inject_rotation_error_deg,
         "translation_optimized": False,
         "navigation": navigation.metrics,
+        "prior_free_initialization": prior_free_initialization_document(
+            prior_free_initialization
+        ),
         "gnss_antenna_lever_arm": {
             "accepted": lever_estimate.accepted,
             "reason": lever_estimate.reason,

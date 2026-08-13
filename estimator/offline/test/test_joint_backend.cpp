@@ -169,3 +169,34 @@ TEST(JointBackend, RecoversFiveDegreeAndThirtyCentimeterPriorError) {
   EXPECT_LT(translation_error, 0.10);
   EXPECT_LT(rotation_error, 1.0);
 }
+
+TEST(JointBackend, RefinesRotationWhileKeepingSurveyedTranslationExact) {
+  offline::RigidTransform truth;
+  truth.translation = Eigen::Vector3d(0.55, -0.18, 0.12);
+  truth.rotation =
+      Eigen::AngleAxisd(4.0 * M_PI / 180.0, Eigen::Vector3d::UnitZ()) *
+      Eigen::AngleAxisd(-2.0 * M_PI / 180.0, Eigen::Vector3d::UnitY());
+  offline::RigidTransform initial = truth;
+  initial.rotation =
+      Eigen::AngleAxisd(8.0 * M_PI / 180.0, Eigen::Vector3d::UnitZ()) *
+      initial.rotation;
+  const auto mapper = syntheticMapper(truth, initial);
+  auto config = testConfig();
+  config.optimize_extrinsic_translation = false;
+  offline::JointCalibrationBackend backend;
+  const auto result = backend.optimize(
+      mapper, "top",
+      {{"top", offline::RigidTransform()}, {"side", initial}}, config);
+
+  EXPECT_TRUE(result.eligible) << result.reason;
+  EXPECT_TRUE(result.converged) << result.reason;
+  const auto estimated = result.optimized_extrinsics.at("side");
+  EXPECT_TRUE(estimated.translation.isApprox(initial.translation, 1e-12));
+  EXPECT_DOUBLE_EQ(0.0,
+                   result.lidar_diagnostics.at("side").translation_update_m);
+  Eigen::Quaterniond rotation_difference =
+      truth.rotation.conjugate() * estimated.rotation;
+  rotation_difference.normalize();
+  EXPECT_LT(Eigen::AngleAxisd(rotation_difference).angle() * 180.0 / M_PI,
+            8.0);
+}

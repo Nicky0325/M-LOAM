@@ -1,7 +1,13 @@
-# Raw-IMU/GNSS fixed-translation multi-LiDAR rotation calibration
+# Rotation-prior-free, fixed-translation multi-LiDAR calibration
 
-This is the canonical description of the repository's offline calibration prototype for a planar vehicle rig. Dataset-specific measurements are kept in
-the [AIV5 raw-sensor report](../aiv5_raw_imu_gnss_10deg_results.md), while commands and artifact handling are in the [offline operation guide](../../estimator/offline/README.md).
+This is the canonical methodology for the repository's rotation-prior-free
+offline calibration of a planar vehicle rig. The arbitrary-orientation
+experiment is in the
+[AIV5 rotation-prior-free report](../aiv5_rotation_prior_free_results.md),
+the earlier local-capture experiment is in the
+[AIV5 10-degree report](../aiv5_raw_imu_gnss_10deg_results.md), and commands and
+artifact handling are in the
+[offline operation guide](../../estimator/offline/README.md).
 
 The complete frame-by-frame derivation, expanded hand-eye equations, Jacobians, and planar observability argument are in the
 [mathematical establishment](fixed_translation_planar_multi_lidar_calibration_math.md).
@@ -9,11 +15,22 @@ The complete frame-by-frame derivation, expanded hand-eye equations, Jacobians, 
 Implementation:
 [`planar_nav_rotation_calibrator.py`](../../estimator/offline/tools/planar_nav_rotation_calibrator.py)
 
+In this document, **rotation-prior-free** means that no supplied or reference
+LiDAR extrinsic rotation is used to initialize ICP, construct a residual,
+constrain an update, or select a solution. A dataset rotation may optionally
+be supplied for an evaluation score that is computed only after the solve. It
+is never part of calibration. The rotation estimated by the global initializer
+may, of course, seed the subsequent guarded local refinement.
+
 ## 1. Design decision and data boundary
 
-The target rig has precise LiDAR translations in the vehicle frame, but its LiDAR rotations may initially be wrong by about 10 degrees. The vehicle motion
-is predominantly planar. The estimator therefore solves only the three rotational degrees of freedom of every `vehicle_T_lidar` transform and copies
-each supplied translation exactly.
+The target rig has precise LiDAR translations in the vehicle frame, but its
+LiDAR rotations may be absent or wrong. The vehicle motion is predominantly
+planar. The estimator therefore solves only the three rotational degrees of
+freedom of every `vehicle_T_lidar` transform and copies each supplied
+translation exactly. In `prior-free` mode, an input `vehicle_T_lidar` needs
+only `translation`; a rotation is parsed only when post-run scoring is
+explicitly requested.
 
 The navigation trajectory is constructed only from:
 
@@ -23,7 +40,10 @@ The navigation trajectory is constructed only from:
 The implementation intentionally does not read the LiDAR-localizer vehicle pose stream, the final INS text result, or the incomplete wheel result. It has
 no command-line argument for any of those sources. This avoids using a pose whose generation already depends on precise LiDAR calibration.
 
-This is not the MLCC-style backend. It is a calibration stage that writes a fixed-extrinsic manifest with the joint backend disabled.
+The global initializer is not the MLCC-style backend. It is a pre-SLAM
+calibration stage. Its corrected manifest disables the backend by default and
+sets `optimize_extrinsic_translation: false`. MLCC can then be enabled as an
+optional, held-out-gated rotation-only local refinement.
 
 ## 2. Why the constrained problem is observable
 
@@ -67,12 +87,15 @@ flowchart LR
     I[Raw IMU] --> N[Dense ENU antenna trajectory]
     G[Raw dual-antenna GNSS] --> N
     N --> A[Vehicle-origin motions A_ij]
-    M[Fixed LiDAR translations and coarse rotations] --> H
-    P[Timestamped LiDAR PCD scans] --> C[Coarse-to-fine ICP]
+    T[Fixed LiDAR translations] --> Y
+    P[Timestamped LiDAR PCD scans] --> C[Identity-seeded multiscale ICP]
     A --> C
-    C --> B[Measured LiDAR motions B_ij]
-    A --> H[Alternating robust hand-eye solve]
-    B --> H
+    C --> B[Independent LiDAR motions B_ij]
+    B --> X[Signed planar-axis recovery]
+    A --> X
+    X --> Y[Global LiDAR yaws and GNSS lever]
+    A --> Y
+    Y --> H[Optional local rotation-only hand-eye solve]
     H --> V[Held-out and Hessian validation]
     V --> E[Corrected fixed-extrinsic manifest]
     V --> Q[Raw-GNSS-anchored colored map]
@@ -80,6 +103,37 @@ flowchart LR
 
 All LiDARs share the same independently measured rig motion. Direct scan overlap between every pair of LiDARs is not required. Relative LiDAR-to-LiDAR
 extrinsics are derived after the vehicle-frame rotations have been estimated.
+
+### 4.1 Algorithm contract
+
+| Category | Quantities |
+|---|---|
+| Required measurements | timestamped LiDAR PCDs, raw IMU, raw dual-antenna GNSS position/velocity/heading |
+| Required calibration | precise `vehicle_T_lidar.translation` for every LiDAR |
+| Estimated globally | one rotation per LiDAR and one shared planar GNSS-antenna lever arm |
+| Held fixed | every LiDAR translation and the vertical antenna-lever component |
+| Explicitly excluded | LiDAR-localizer `vehicle_pose`, final `ins.txt`, final/incomplete wheel result |
+| Optional evaluation only | manifest LiDAR rotations through `--score-against-manifest` |
+| Optional local backend | rotation-only MLCC with all extrinsic translations constant |
+
+The implemented sequence is:
+
+```text
+construct raw IMU/GNSS navigation trajectory
+select turn-rich scan pairs
+for each LiDAR:
+    register each pair from identity
+    reject motions whose rotation magnitude disagrees with navigation
+    assign accepted motions deterministically to training or held-out data
+    robustly estimate the signed planar rotation axis
+    align that axis to the vehicle planar axis
+jointly solve all remaining LiDAR yaws and the planar GNSS lever on training data
+validate the global solution on held-out motions
+retain a local 3-DoF hand-eye proposal only if held-out score improves
+reject the complete rig if any observability or held-out gate fails
+write relative extrinsics, a fixed-translation manifest, and an ENU map
+optionally run rotation-only MLCC as a separately gated local refinement
+```
 
 ## 5. Raw navigation construction
 
@@ -146,10 +200,25 @@ it does not change any supplied LiDAR translation.
 For each LiDAR, candidate scans must lie inside raw-navigation coverage. With the defaults, the tool examines every fifth start scan, pairs it with a scan 15
 frames later, retains 0.8--6.0 m motions, ranks them by `rotation_deg + 0.2 * translation_m`, and keeps the best 40. This favors turns while excluding stationary and excessively long registrations.
 
-The coarse extrinsic and raw navigation predict the initial LiDAR motion. The scan at `j` is registered into the scan at `i` with three-stage Open3D
-point-to-plane ICP. Points outside 2--80 m are removed, clouds are voxelized at 0.45 m, and normals are estimated locally. Correspondence distances are four, two, and one voxel widths.
+Points outside 2--80 m are removed and normals are estimated locally. Two
+registration paths are available:
 
-A measured motion is retained only if:
+- `manifest` uses the supplied rotation and fixed translation to predict the
+  initial LiDAR motion. Three-stage point-to-plane ICP uses a 0.45 m voxel and
+  correspondence distances of four, two, and one voxel widths. This path is
+  used for the deterministic 10-degree local-capture test.
+- `prior-free` never constructs an extrinsic prediction. Point-to-plane ICP
+  starts at identity with a 0.70 m voxel and the default distance schedule
+  5, 3, 2, 1, and 0.70 m. If its quality or motion angle is implausible, one
+  fallback starts again at identity with an 8 m first level.
+
+Hand-eye conjugation preserves rotation angle. The raw navigation turn
+magnitude can therefore select or reject an identity-seeded ICP hypothesis
+without revealing the unknown LiDAR-frame rotation axis. Prior-free motions
+must have at least 0.15 fitness, at most 0.90 m inlier RMSE, no more than 2.5
+degrees of rotation-magnitude disagreement, and no more than 10 m translation.
+
+On the manifest-seeded path, a measured motion is retained only if:
 
 | Gate | Default |
 |---|---:|
@@ -158,13 +227,33 @@ A measured motion is retained only if:
 | Translation correction from prediction | at most 2.5 m |
 | Rotation correction from prediction | at most 10 degrees |
 
-ICP is currently measured once from the coarse prediction; it is not rerun after every calibration update.
+ICP is measured once and is not rerun after every calibration update.
 
-## 7. Alternating calibration solve
+## 7. Rotation-prior-free global initializer
+
+For planar vehicle motion, the signed rotation vector of a LiDAR motion points
+along the vehicle vertical expressed in that LiDAR frame. Raw-navigation yaw
+supplies the sign. Each LiDAR axis is estimated with a one-sample RANSAC and a
+weighted mean; samples more than 4 degrees from the selected axis are removed.
+
+The minimum rotation that maps the LiDAR axis to the navigation planar axis
+fixes two rotational degrees of freedom. The remaining family is a yaw about
+the navigation planar axis. For a fixed antenna lever, each yaw first receives
+a closed-form two-dimensional Procrustes estimate from the translational
+hand-eye equation and the known LiDAR translation.
+
+One robust multi-start least-squares solve then estimates all LiDAR yaws and
+the two horizontal components of the shared GNSS-antenna lever together. Its
+starts use zero, every LiDAR translation, and their median as lever seeds. The
+manifest rotations do not appear in ICP, axis recovery, starting values,
+residuals, or validation.
+
+## 8. Local fixed-translation refinement
 
 Only each `R_l` and the shared planar GNSS lever arm `g` are variables. Every LiDAR translation `t_l` remains a constant copied from the manifest.
 
-For a fixed `g`, LiDAR rotation is represented as a bounded right perturbation of the coarse rotation:
+For a fixed `g`, LiDAR rotation is represented as a bounded right perturbation
+of the selected initializer:
 
 ```text
 R_l(delta) = R_l_initial * Exp(delta)
@@ -179,12 +268,23 @@ r = w * [2 * Log(transpose(R_B) * R_B_hat), t_B_hat - t_B]
 w = sqrt(max(0.05, ICP_fitness)) / max(0.10, ICP_inlier_RMSE).
 ```
 
-SciPy least squares uses a Cauchy loss and a default 15-degree component bound. With all LiDAR rotations fixed, a second robust two-parameter solve updates `g_x` and `g_y` from the hand-eye translation residuals across all LiDARs. Rotation and lever-arm solves alternate up to 15 iterations or until the lever change is below 0.1 mm.
+SciPy least squares uses a Cauchy loss and a default 15-degree component bound.
+With all LiDAR rotations fixed, a second robust two-parameter solve updates
+`g_x` and `g_y` from the hand-eye translation residuals across all LiDARs.
+Rotation and lever-arm solves alternate up to 15 iterations or until the lever
+change is below 0.1 mm.
+
+For a manifest-seeded run, the local update must improve held-out translation
+and may regress held-out rotation by at most 5%. For a prior-free run, the
+global initializer is already a complete solution. A local proposal is kept
+only when its normalized held-out translation-plus-rotation score improves;
+otherwise the initializer is retained. This model selection prevented local
+overfitting on the AIV5 run.
 
 The reported antenna lever arm is a nuisance estimate that makes raw GNSS antenna motion consistent with all fixed LiDAR lever arms. It should not be
 treated as a surveyed antenna measurement without independent validation.
 
-## 8. Held-out validation and observability
+## 9. Held-out validation and observability
 
 Accepted ICP constraints are split deterministically in temporal order: every
 fifth constraint is held out; the other four train the estimator. The default
@@ -196,7 +296,13 @@ For each LiDAR, the approximate three-by-three rotation Hessian is
 H_R = transpose(J_R) * J_R.
 ```
 
-An update is accepted only when:
+The prior-free initializer is accepted only when every selected LiDAR has
+enough training and held-out motions, its signed axis is stable, held-out
+translation RMSE is at most 0.75 m, and held-out rotation RMSE is at most 2.5
+degrees. The joint `(N LiDAR yaws + 2 lever components)` Hessian must have
+minimum eigenvalue above `1e-9` and condition number below `1e8`.
+
+A local rotation update is accepted only when:
 
 - the nonlinear solve succeeds;
 - the smallest Hessian eigenvalue exceeds `1e-9`;
@@ -212,7 +318,7 @@ held-out translation error must not regress materially.
 The run is atomic across the selected rig: the corrected manifest and maps are
 published only when the antenna lever and every selected LiDAR pass.
 
-## 9. Relative extrinsics and globally referenced map
+## 10. Relative extrinsics and globally referenced map
 
 For reference LiDAR `r` and LiDAR `l`, the output is
 
@@ -237,38 +343,53 @@ same raw trajectory: occupied voxel count, cross-LiDAR overlap within one
 metre, and nearest-neighbour median/p95. These are consistency indicators, not
 surveyed map-accuracy measurements.
 
-## 10. Relationship to M-LOAM and MLCC
+## 11. Relationship to M-LOAM and MLCC
 
 | Component | Role | Calibration behavior |
 |---|---|---|
-| Raw IMU/GNSS calibrator | pre-SLAM rotation recovery and ENU map | LiDAR rotations optimized; LiDAR translations fixed |
+| Raw IMU/GNSS calibrator | global no-prior initialization and ENU map | LiDAR rotations optimized; LiDAR translations fixed |
 | Fixed-extrinsic M-LOAM | LiDAR odometry/integration check | all extrinsics fixed |
-| MLCC-style batch backend | separate experimental joint refinement | pose and full extrinsics may change |
+| MLCC-style batch backend | optional guarded local refinement | poses and rotations may change; translations can be locked |
 
-The successful AIV5 result uses the first row. The generated
-`corrected_manifest.yaml` sets `joint_backend.enabled: false` and
-`joint_backend.mode: disabled`; no MLCC factor, initialization, or update
-contributes to the reported calibration.
+The successful AIV5 initializer and ENU map use the first row. The generated
+`corrected_manifest.yaml` sets `joint_backend.enabled: false`, mode `disabled`,
+and `optimize_extrinsic_translation: false`; no MLCC factor contributes to the
+reported calibration. A separate stride-four MLCC replay kept translations
+exactly fixed and safely rejected a held-out-regressing rotation proposal.
 
 M-LOAM can consume the corrected manifest as a separate fixed-extrinsic smoke
 or odometry test. Its local accumulated map is not automatically an ENU map.
 
-## 11. Reproduction
+## 12. Reproduction
 
 From the repository root:
 
 ```bash
 python3 estimator/offline/tools/planar_nav_rotation_calibrator.py \
   --manifest estimator/config/offline/aiv5_sequence.yaml \
-  --output-dir data/aiv5_raw_imu_gnss_10deg \
-  --inject-rotation-error-deg 10 --seed 42 \
+  --output-dir data/aiv5_rotation_prior_free \
+  --rotation-initialization prior-free \
   --map-stride 10 --map-voxel-size 0.35
 ```
 
 The default raw inputs are `<dataset_root>/imu.txt` and
 `<dataset_root>/gnss/`. Override them only with `--imu-file` and `--gnss-dir`.
-For a real coarse calibration, omit `--inject-rotation-error-deg`. If the GNSS
-heading baseline's yaw relative to vehicle x is known, pass it explicitly:
+This command does not use manifest rotations. Add
+`--score-against-manifest` only for a dataset experiment in which the manifest
+rotations should be revealed after optimization. For the older local 10-degree
+capture test, use manifest initialization and injection explicitly:
+
+```bash
+python3 estimator/offline/tools/planar_nav_rotation_calibrator.py \
+  --manifest estimator/config/offline/aiv5_sequence.yaml \
+  --output-dir data/aiv5_raw_imu_gnss_10deg \
+  --rotation-initialization manifest \
+  --inject-rotation-error-deg 10 --seed 42 \
+  --map-stride 10 --map-voxel-size 0.35
+```
+
+If the GNSS heading baseline's yaw relative to vehicle x is known, pass it
+explicitly:
 
 ```bash
   --gnss-heading-to-vehicle-yaw-deg <measured-yaw>
@@ -278,16 +399,16 @@ The perturbation test uses the manifest rotations only to generate a hidden
 deterministic 10-degree error and score the recovered result. The trusted
 rotations are not residuals or priors in the optimizer.
 
-## 12. Output contract
+## 13. Output contract
 
 | Artifact | Contents |
 |---|---|
 | `summary.yaml` | raw-input quality, fusion fit, lever estimate, constraints, Hessians, held-out results, and map metrics |
 | `pair_constraints.csv` | pair indices, motion excitation, ICP quality, gates, and split |
-| `relative_extrinsics.yaml` | reference-to-LiDAR transforms and perturbation-test scores |
+| `relative_extrinsics.yaml` | reference-to-LiDAR transforms and optional post-run manifest scores |
 | `trajectory_navigation.csv` | raw-GNSS/IMU-derived vehicle and reference-LiDAR poses |
-| `corrected_manifest.yaml` | recovered rotations, exactly copied translations, and disabled backend |
-| `map_initial_rgb.pcd` | map using coarse or injected rotations |
+| `corrected_manifest.yaml` | recovered rotations, exactly copied translations, disabled backend, and rotation-only backend policy |
+| `map_initial_rgb.pcd` | map using the selected global, coarse, or injected initializer |
 | `map_optimized_rgb.pcd` | map using accepted rotations |
 | `map_<lidar>.pcd` | accepted per-LiDAR ENU map |
 
@@ -296,7 +417,7 @@ one calibration was rejected, and status `1` means an input or execution
 error. Consumers should inspect `summary.yaml`; partial diagnostics do not
 imply acceptance.
 
-## 13. When wheel data or vehicle kinematics become necessary
+## 14. When wheel data or vehicle kinematics become necessary
 
 They are not required for this AIV5 sequence. It has continuous RTK-fixed
 position, raw ENU velocity, usable dual-antenna RTK heading, a stationary IMU
@@ -317,7 +438,7 @@ Wheel/steering data or another odometry source becomes useful or necessary if:
 
 A complete bicycle or Ackermann model is not otherwise part of this method.
 
-## 14. Known limitations
+## 15. Known limitations
 
 - The method currently assumes planar motion and holds roll/pitch constant
   after gravity initialization.
@@ -327,12 +448,15 @@ A complete bicycle or Ackermann model is not otherwise part of this method.
   surveyed mounting transform.
 - GNSS and IMU clock offsets are not estimated.
 - Point-level LiDAR deskew is absent.
-- ICP constraints are not recomputed after rotation refinement.
+- Identity-seeded ICP remains dependent on scene overlap and geometry, and its
+  constraints are not recomputed after rotation refinement.
 - The antenna lever arm's vertical component is unobservable and fixed to zero.
-- The six LiDAR rotations are optimized against shared navigation but not in a
-  single scan-overlap factor graph.
+- The six yaw states and shared antenna lever are solved jointly against
+  navigation, but full rotations are not jointly optimized in a single
+  scan-overlap factor graph.
 - The supplied reference rotations are not independently surveyed ground
   truth; recovery error is agreement with that reference.
-- The 10-degree result currently covers one deterministic perturbation seed on
-  one sequence, not a production success-rate guarantee.
+- The no-prior result covers one sequence, and the 10-degree result covers one
+  deterministic perturbation seed; neither is a production success-rate
+  guarantee.
 - GNSS-denied operation still needs loop closure and pose-graph optimization.

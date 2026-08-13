@@ -2,6 +2,16 @@
 
 Date: 2026-08-06
 
+> **Implementation update (2026-08-13):** The proposed identity-ICP,
+> signed-axis, and fixed-translation yaw initializer has now been implemented
+> and run on all six AIV5 LiDARs. It succeeded without using manifest rotations
+> and achieved 1.048-degree mean / 1.794-degree maximum relative rotation
+> difference after scoring. See the
+> [implementation result](aiv5_rotation_prior_free_results.md). Statements
+> below that arbitrary-orientation recovery had not yet been demonstrated are
+> retained as the conclusion of the earlier investigation, not the current
+> repository status.
+
 ## Scope
 
 This report investigates whether the AIV5 sequence can support multi-LiDAR

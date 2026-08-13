@@ -40,9 +40,12 @@ International Conference on Robotics and Automation (*ICRA*) 2021 , Xi An, China
 
 This branch includes an offline PCD runner and a raw-IMU/GNSS-aided calibration
 method for vehicle rigs whose LiDAR translations are known but rotations are
-coarse. It does not use a LiDAR-localizer pose, downstream INS result, or wheel
-result. Start with the [documentation index](docs/README.md), read the
+unknown or coarse. It does not use a LiDAR-localizer pose, downstream INS
+result, or wheel result. Start with the
+[documentation index](docs/README.md), read the
 [calibration methodology](docs/methodology/fixed_translation_planar_multi_lidar_calibration.md),
+continue with the
+[mathematical establishment](docs/methodology/fixed_translation_planar_multi_lidar_calibration_math.md),
 or go directly to the [offline operation guide](estimator/offline/README.md).
 
 <!-- ----------------------------------------------------------- -->
